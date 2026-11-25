@@ -1,15 +1,18 @@
 #!/bin/bash
+# Builds a universal (Apple Silicon + Intel) app. Usage: bash build.sh ["/path/to/DOCX Lite.app"]
 set -euo pipefail
-TASK_SOURCE_DIR="$(cd "$(dirname "$0")" && pwd)"
-TASK_APP_PATH="${1:-$HOME/Desktop/Lettore DOCX.app}"
-mkdir -p "$TASK_APP_PATH/Contents/MacOS" "$TASK_APP_PATH/Contents/Resources"
-xcrun swiftc -O -whole-module-optimization -swift-version 5 \
-    -target arm64-apple-macosx13.0 -module-cache-path /private/tmp/lettoredocx-module-cache \
-    "$TASK_SOURCE_DIR/main.swift" -o "$TASK_APP_PATH/Contents/MacOS/LettoreDOCX"
-cp "$TASK_SOURCE_DIR/Info.plist" "$TASK_APP_PATH/Contents/Info.plist"
-if [[ -f "$TASK_SOURCE_DIR/AppIcon.icns" ]]; then
-    cp "$TASK_SOURCE_DIR/AppIcon.icns" "$TASK_APP_PATH/Contents/Resources/AppIcon.icns"
-fi
-strip -x "$TASK_APP_PATH/Contents/MacOS/LettoreDOCX"
-codesign --force --sign - "$TASK_APP_PATH"
-du -sh "$TASK_APP_PATH"
+SRC="$(cd "$(dirname "$0")" && pwd)"
+APP="${1:-$HOME/Desktop/DOCX Lite.app}"
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+for ARCH in arm64 x86_64; do
+    xcrun swiftc -O -whole-module-optimization -swift-version 5 \
+        -target "$ARCH-apple-macosx13.0" -module-cache-path "$TMP/cache" \
+        "$SRC/main.swift" -o "$TMP/DOCXLite-$ARCH"
+done
+lipo -create "$TMP/DOCXLite-arm64" "$TMP/DOCXLite-x86_64" -output "$APP/Contents/MacOS/DOCXLite"
+strip -x "$APP/Contents/MacOS/DOCXLite"
+cp "$SRC/Info.plist" "$APP/Contents/Info.plist"
+cp "$SRC/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+codesign --force --sign - "$APP"
+du -sh "$APP"

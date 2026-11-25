@@ -37,7 +37,7 @@ func scheduleReaderTests(_ reader: ReaderApp, fixture: URL) {
             check(reader.matchIndex == 0, "Search wraps forwards")
             reader.search.stringValue = "nonexistent-word"
             reader.updateMatches()
-            check(reader.matches.isEmpty && reader.searchStatus.stringValue == "Nessun risultato", "No search results")
+            check(reader.matches.isEmpty && reader.searchStatus.stringValue == L("Nessun risultato", "No results"), "No search results")
             reader.search.stringValue = ""
             reader.updateMatches()
             check(reader.searchStatus.stringValue.isEmpty, "Search cleared")

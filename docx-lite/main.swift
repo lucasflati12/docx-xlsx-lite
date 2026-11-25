@@ -1,7 +1,11 @@
 import AppKit
 import UniformTypeIdentifiers
 
-private let docxType = UTType(filenameExtension: "docx")!
+let appName = "DOCX Lite"
+let italian = (Locale.preferredLanguages.first ?? "").lowercased().hasPrefix("it")
+func L(_ it: String, _ en: String) -> String { italian ? it : en }
+let readableExtensions = ["docx", "doc", "odt", "rtf"]
+private let readableTypes = readableExtensions.compactMap { UTType(filenameExtension: $0) }
 
 private struct EmbeddedPicture {
     let marker: String
@@ -26,7 +30,7 @@ private func archiveMember(_ archive: URL, _ member: String) throws -> Data {
     let data = output.fileHandleForReading.readDataToEndOfFile()
     process.waitUntilExit()
     guard process.terminationStatus == 0 else {
-        throw NSError(domain: "LettoreDOCX", code: 2, userInfo: [NSLocalizedDescriptionKey: "Archivio DOCX non leggibile."])
+        throw NSError(domain: "LettoreDOCX", code: 2, userInfo: [NSLocalizedDescriptionKey: L("Archivio DOCX non leggibile.", "Unreadable DOCX archive.")])
     }
     return data
 }
@@ -110,17 +114,20 @@ struct WordDocument {
     let wordCount: Int
 
     init(url: URL) throws {
-        guard url.pathExtension.lowercased() == "docx" else {
+        let ext = url.pathExtension.lowercased()
+        guard readableExtensions.contains(ext) else {
             throw NSError(domain: "LettoreDOCX", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "Scegli un documento Word (.docx)."
+                NSLocalizedDescriptionKey: L("Scegli un documento .docx, .doc, .odt o .rtf.", "Choose a .docx, .doc, .odt or .rtf document.")
             ])
         }
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("lettoredocx-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: temporary) }
-        let (importURL, pictures, links) = try preparePictures(url, in: temporary)
+        // DOCX gets the picture/link pass; .doc, .odt and .rtf use the native importers as they are.
+        let (importURL, pictures, links) = ext == "docx" ? try preparePictures(url, in: temporary) : (url, [], [])
+        let types: [String: NSAttributedString.DocumentType] = ["docx": .officeOpenXML, "doc": .docFormat, "odt": .openDocument, "rtf": .rtf]
         var attributes: NSDictionary?
         let imported = try NSMutableAttributedString(url: importURL, options: [
-            .documentType: NSAttributedString.DocumentType.officeOpenXML
+            .documentType: types[ext] ?? .officeOpenXML
         ], documentAttributes: &attributes)
         let metadata = attributes as? [NSAttributedString.DocumentAttributeKey: Any] ?? [:]
         let size = (metadata[.paperSize] as? NSValue)?.sizeValue ?? NSSize(width: 595, height: 842)
@@ -172,7 +179,7 @@ final class PaperCanvas: NSView {
         let files = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [
             .urlReadingFileURLsOnly: true
         ]) as? [URL] ?? []
-        return files.first { $0.pathExtension.lowercased() == "docx" }
+        return files.first { readableExtensions.contains($0.pathExtension.lowercased()) }
     }
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         documentURL(sender) == nil ? [] : .copy
@@ -190,24 +197,24 @@ final class ReaderTextView: NSTextView {
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { [] }
     override func menu(for event: NSEvent) -> NSMenu? {
         let menu = NSMenu()
-        menu.addItem(withTitle: "Copia", action: #selector(copy(_:)), keyEquivalent: "")
-        menu.addItem(withTitle: "Seleziona tutto", action: #selector(selectAll(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: L("Copia", "Copy"), action: #selector(copy(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: L("Seleziona tutto", "Select All"), action: #selector(selectAll(_:)), keyEquivalent: "")
         return menu
     }
 }
 
-final class ReaderApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSearchFieldDelegate, NSTextViewDelegate {
+final class ReaderApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSearchFieldDelegate, NSTextViewDelegate, NSMenuItemValidation {
     var window: NSWindow!
     let scroll = NSScrollView()
     let canvas = PaperCanvas(frame: .zero)
     let textView = ReaderTextView(frame: .zero)
     let search = NSSearchField()
     let zoomLabel = NSButton(title: "100%", target: nil, action: nil)
-    let status = NSTextField(labelWithString: "Sola lettura")
+    let status = NSTextField(labelWithString: L("Sola lettura", "Read-only"))
     let searchStatus = NSTextField(labelWithString: "")
     let progress = NSProgressIndicator()
     let emptyState = NSStackView()
-    let recentMenu = NSMenu(title: "Apri recenti")
+    let recentMenu = NSMenu(title: L("Apri recenti", "Open Recent"))
     var document: WordDocument?
     var currentURL: URL?
     var pendingURL: URL?
@@ -248,47 +255,53 @@ final class ReaderApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSear
             main.addItem(item)
             return sub
         }
-        func add(_ menu: NSMenu, _ title: String, _ action: Selector, _ key: String, target: AnyObject? = nil) {
-            menu.addItem(withTitle: title, action: action, keyEquivalent: key).target = target
+        func add(_ menu: NSMenu, _ title: String, _ action: Selector, _ key: String, _ mods: NSEvent.ModifierFlags = .command, target: AnyObject? = nil) {
+            let item = menu.addItem(withTitle: title, action: action, keyEquivalent: key)
+            item.keyEquivalentModifierMask = mods
+            item.target = target
         }
-        let app = submenu("Lettore DOCX")
-        add(app, "Informazioni su Lettore DOCX", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), "")
+        let app = submenu(appName)
+        add(app, L("Informazioni su \(appName)", "About \(appName)"), #selector(NSApplication.orderFrontStandardAboutPanel(_:)), "")
         app.addItem(.separator())
-        add(app, "Nascondi Lettore DOCX", #selector(NSApplication.hide(_:)), "h")
+        add(app, L("Nascondi \(appName)", "Hide \(appName)"), #selector(NSApplication.hide(_:)), "h")
+        add(app, L("Nascondi altre", "Hide Others"), #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option])
         app.addItem(.separator())
-        add(app, "Esci da Lettore DOCX", #selector(NSApplication.terminate(_:)), "q")
+        add(app, L("Esci da \(appName)", "Quit \(appName)"), #selector(NSApplication.terminate(_:)), "q")
         let file = submenu("File")
-        add(file, "Apri…", #selector(openFile), "o", target: self)
-        let recentItem = NSMenuItem(title: "Apri recenti", action: nil, keyEquivalent: "")
+        add(file, L("Apri…", "Open…"), #selector(openFile), "o", target: self)
+        let recentItem = NSMenuItem(title: recentMenu.title, action: nil, keyEquivalent: "")
         recentItem.submenu = recentMenu
         file.addItem(recentItem)
         refreshRecentMenu()
-        add(file, "Chiudi", #selector(NSWindow.performClose(_:)), "w")
+        add(file, L("Chiudi", "Close"), #selector(NSWindow.performClose(_:)), "w")
         file.addItem(.separator())
-        add(file, "Stampa…", #selector(printDocument), "p", target: self)
-        let edit = submenu("Modifica")
-        add(edit, "Copia", #selector(NSText.copy(_:)), "c")
-        add(edit, "Incolla", #selector(NSText.paste(_:)), "v")
-        add(edit, "Seleziona tutto", #selector(NSText.selectAll(_:)), "a")
+        add(file, L("Esporta come PDF…", "Export as PDF…"), #selector(exportPDF), "e", [.command, .shift], target: self)
+        add(file, L("Stampa…", "Print…"), #selector(printDocument), "p", target: self)
+        let edit = submenu(L("Modifica", "Edit"))
+        add(edit, L("Copia", "Copy"), #selector(NSText.copy(_:)), "c")
+        add(edit, L("Seleziona tutto", "Select All"), #selector(NSText.selectAll(_:)), "a")
         edit.addItem(.separator())
-        add(edit, "Cerca nel documento…", #selector(focusSearch), "f", target: self)
-        add(edit, "Trova successivo", #selector(findNext), "g", target: self)
-        add(edit, "Trova precedente", #selector(findPrevious), "G", target: self)
-        let view = submenu("Vista")
-        add(view, "Ingrandisci", #selector(zoomIn), "+", target: self)
-        add(view, "Riduci", #selector(zoomOut), "-", target: self)
-        add(view, "Dimensioni originali", #selector(resetZoom), "0", target: self)
-        add(view, "Adatta alla finestra", #selector(fitWidth), "9", target: self)
+        add(edit, L("Cerca nel documento…", "Find…"), #selector(focusSearch), "f", target: self)
+        add(edit, L("Trova successivo", "Find Next"), #selector(findNext), "g", target: self)
+        add(edit, L("Trova precedente", "Find Previous"), #selector(findPrevious), "g", [.command, .shift], target: self)
+        let view = submenu(L("Vista", "View"))
+        add(view, L("Ingrandisci", "Zoom In"), #selector(zoomIn), "+", target: self)
+        add(view, L("Riduci", "Zoom Out"), #selector(zoomOut), "-", target: self)
+        add(view, L("Dimensioni reali", "Actual Size"), #selector(resetZoom), "0", target: self)
+        add(view, L("Adatta alla finestra", "Fit Width"), #selector(fitWidth), "9", target: self)
         view.addItem(.separator())
-        add(view, "Schermo intero", #selector(NSWindow.toggleFullScreen(_:)), "f")
-        view.items.last?.keyEquivalentModifierMask = [.command, .control]
+        add(view, L("Schermo intero", "Enter Full Screen"), #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control])
+        let windowMenu = submenu(L("Finestra", "Window"))
+        add(windowMenu, L("Contrai", "Minimize"), #selector(NSWindow.performMiniaturize(_:)), "m")
+        add(windowMenu, L("Ridimensiona", "Zoom"), #selector(NSWindow.performZoom(_:)), "")
+        NSApp.windowsMenu = windowMenu
         NSApp.mainMenu = main
     }
 
     private func buildWindow() {
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 780),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "Lettore DOCX"
+        window.title = appName
         window.minSize = NSSize(width: 680, height: 420)
         window.delegate = self
         window.isReleasedWhenClosed = false
@@ -296,27 +309,27 @@ final class ReaderApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSear
         window.setFrameAutosaveName("ReaderWindow")
         let content = window.contentView!
 
-        let open = NSButton(title: "Apri…", target: self, action: #selector(openFile))
-        open.toolTip = "Apri un documento Word (⌘O)"
-        search.placeholderString = "Cerca nel documento"
+        let open = NSButton(title: L("Apri…", "Open…"), target: self, action: #selector(openFile))
+        open.toolTip = L("Apri un documento (⌘O)", "Open a document (⌘O)")
+        search.placeholderString = L("Cerca nel documento", "Search document")
         search.delegate = self
         search.target = self
         search.action = #selector(findNext)
         search.sendsSearchStringImmediately = false
         search.sendsWholeSearchString = true
         search.widthAnchor.constraint(equalToConstant: 210).isActive = true
-        search.setAccessibilityLabel("Cerca nel documento")
+        search.setAccessibilityLabel(L("Cerca nel documento", "Search document"))
         let minus = NSButton(title: "−", target: self, action: #selector(zoomOut))
         let plus = NSButton(title: "+", target: self, action: #selector(zoomIn))
-        minus.toolTip = "Riduci (⌘−)"
-        plus.toolTip = "Ingrandisci (⌘+)"
+        minus.toolTip = L("Riduci (⌘−)", "Zoom out (⌘−)")
+        plus.toolTip = L("Ingrandisci (⌘+)", "Zoom in (⌘+)")
         zoomLabel.target = self
         zoomLabel.action = #selector(resetZoom)
-        zoomLabel.toolTip = "Ripristina 100% (⌘0)"
+        zoomLabel.toolTip = L("Dimensioni reali (⌘0)", "Actual size (⌘0)")
         zoomLabel.widthAnchor.constraint(equalToConstant: 58).isActive = true
-        let fit = NSButton(image: NSImage(systemSymbolName: "arrow.left.and.right", accessibilityDescription: "Adatta alla finestra")!,
+        let fit = NSButton(image: NSImage(systemSymbolName: "arrow.left.and.right", accessibilityDescription: L("Adatta alla finestra", "Fit width"))!,
                            target: self, action: #selector(fitWidth))
-        fit.toolTip = "Adatta alla finestra (⌘9)"
+        fit.toolTip = L("Adatta alla finestra (⌘9)", "Fit width (⌘9)")
         progress.style = .spinning
         progress.controlSize = .small
         progress.isDisplayedWhenStopped = false
@@ -358,16 +371,16 @@ final class ReaderApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSear
         textView.textContainer?.lineFragmentPadding = 0
         textView.delegate = self
         textView.unregisterDraggedTypes()
-        textView.setAccessibilityLabel("Contenuto del documento, sola lettura")
+        textView.setAccessibilityLabel(L("Contenuto del documento, sola lettura", "Document content, read-only"))
         canvas.addSubview(textView)
         textView.isHidden = true
 
         let icon = NSImageView(image: NSImage(systemSymbolName: "doc.text", accessibilityDescription: nil)!)
         icon.contentTintColor = .tertiaryLabelColor
         icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 44, weight: .ultraLight)
-        let title = NSTextField(labelWithString: "Apri un documento")
+        let title = NSTextField(labelWithString: L("Apri un documento", "Open a document"))
         title.font = .systemFont(ofSize: 21, weight: .medium)
-        let hint = NSTextField(labelWithString: "Trascina qui un file .docx oppure premi ⌘O")
+        let hint = NSTextField(labelWithString: L("Trascina qui un file .docx, .doc, .odt o .rtf oppure premi ⌘O", "Drop a .docx, .doc, .odt or .rtf file here or press ⌘O"))
         hint.font = .systemFont(ofSize: 13)
         hint.textColor = .secondaryLabelColor
         emptyState.orientation = .vertical
@@ -432,8 +445,8 @@ final class ReaderApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSear
 
     @objc func openFile() {
         let panel = NSOpenPanel()
-        panel.title = "Apri documento Word"
-        panel.allowedContentTypes = [docxType]
+        panel.title = L("Apri documento", "Open Document")
+        panel.allowedContentTypes = readableTypes
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         if let currentURL { panel.directoryURL = currentURL.deletingLastPathComponent() }
@@ -451,11 +464,11 @@ final class ReaderApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSear
             item.toolTip = url.path
         }
         if recentMenu.items.isEmpty {
-            let item = recentMenu.addItem(withTitle: "Nessun documento recente", action: nil, keyEquivalent: "")
+            let item = recentMenu.addItem(withTitle: L("Nessun documento recente", "No Recent Documents"), action: nil, keyEquivalent: "")
             item.isEnabled = false
         } else {
             recentMenu.addItem(.separator())
-            recentMenu.addItem(withTitle: "Cancella elenco", action: #selector(clearRecent), keyEquivalent: "").target = self
+            recentMenu.addItem(withTitle: L("Cancella elenco", "Clear Menu"), action: #selector(clearRecent), keyEquivalent: "").target = self
         }
     }
     @objc private func openRecent(_ sender: NSMenuItem) {
@@ -470,7 +483,7 @@ final class ReaderApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSear
         let request = UUID()
         loadID = request
         progress.startAnimation(nil)
-        status.stringValue = "Apertura di \(url.lastPathComponent)…"
+        status.stringValue = L("Apertura di \(url.lastPathComponent)…", "Opening \(url.lastPathComponent)…")
         loader.async { [weak self] in
             let result = Result { try WordDocument(url: url) }
             DispatchQueue.main.async {
@@ -481,8 +494,8 @@ final class ReaderApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSear
                 case .failure:
                     self.updateStatus()
                     let alert = NSAlert()
-                    alert.messageText = "Impossibile aprire il documento"
-                    alert.informativeText = "Il file potrebbe essere danneggiato, protetto da password o non essere un documento DOCX valido."
+                    alert.messageText = L("Impossibile aprire il documento", "Can't open the document")
+                    alert.informativeText = L("Il file potrebbe essere danneggiato, protetto da password o in un formato non supportato.", "The file may be damaged, password-protected or in an unsupported format.")
                     alert.addButton(withTitle: "OK")
                     alert.beginSheetModal(for: self.window)
                 }
@@ -507,7 +520,7 @@ final class ReaderApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSear
         textView.setSelectedRange(NSRange(location: 0, length: 0))
         search.stringValue = ""
         updateMatches()
-        window.title = url.lastPathComponent + " — Lettore DOCX"
+        window.title = url.lastPathComponent
         window.representedURL = url
         NSDocumentController.shared.noteNewRecentDocumentURL(url)
         refreshRecentMenu()
@@ -519,9 +532,9 @@ final class ReaderApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSear
     }
 
     private func updateStatus() {
-        guard let document else { status.stringValue = "Sola lettura"; return }
+        guard let document else { status.stringValue = L("Sola lettura", "Read-only"); return }
         let count = NumberFormatter.localizedString(from: NSNumber(value: document.wordCount), number: .decimal)
-        status.stringValue = "\(count) \(document.wordCount == 1 ? "parola" : "parole") · Sola lettura"
+        status.stringValue = document.wordCount == 1 ? L("1 parola · Sola lettura", "1 word · Read-only") : L("\(count) parole · Sola lettura", "\(count) words · Read-only")
     }
 
     @objc func focusSearch() { window.makeFirstResponder(search) }
@@ -549,7 +562,7 @@ final class ReaderApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSear
             let next = NSMaxRange(match)
             remaining = NSRange(location: next, length: text.length - next)
         }
-        searchStatus.stringValue = matches.isEmpty ? "Nessun risultato" : "\(matches.count) risultati"
+        searchStatus.stringValue = matches.isEmpty ? L("Nessun risultato", "No results") : L("\(matches.count) risultati", "\(matches.count) results")
     }
     private func selectMatch(_ index: Int) {
         guard !matches.isEmpty else { return }
@@ -558,7 +571,7 @@ final class ReaderApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSear
         textView.setSelectedRange(range)
         textView.scrollRangeToVisible(range)
         textView.showFindIndicator(for: range)
-        searchStatus.stringValue = "\(matchIndex + 1) di \(matches.count)"
+        searchStatus.stringValue = L("\(matchIndex + 1) di \(matches.count)", "\(matchIndex + 1) of \(matches.count)")
     }
     @objc func findNext() {
         if matches.isEmpty { updateMatches() }
@@ -578,7 +591,23 @@ final class ReaderApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSear
         viewportChanged()
     }
 
-    @objc func printDocument() {
+    @objc func printDocument() { runPrint(to: nil) }
+    @objc func exportPDF() {
+        guard let currentURL, document != nil else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.pdf]
+        panel.nameFieldStringValue = currentURL.deletingPathExtension().lastPathComponent + ".pdf"
+        panel.directoryURL = currentURL.deletingLastPathComponent()
+        panel.beginSheetModal(for: window) { [weak self] result in
+            if result == .OK, let url = panel.url { self?.runPrint(to: url) }
+        }
+    }
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        if item.action == #selector(exportPDF) || item.action == #selector(printDocument) { return document != nil }
+        return true
+    }
+    /// Prints, or writes a PDF when `pdf` is set, from a separate text view at the document's page size.
+    func runPrint(to pdf: URL?) {
         guard let document else { return }
         // Print a separate text view so screen zoom and search highlights never reach the output.
         let printable = NSTextView(frame: NSRect(origin: .zero, size: document.pageSize))
@@ -595,7 +624,12 @@ final class ReaderApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSear
         info.isHorizontallyCentered = false
         info.isVerticallyCentered = false
         let operation = NSPrintOperation(view: printable, printInfo: info)
-        operation.jobTitle = currentURL?.deletingPathExtension().lastPathComponent ?? "Documento"
+        if let pdf {
+            info.jobDisposition = .save
+            info.dictionary()[NSPrintInfo.AttributeKey.jobSavingURL] = pdf
+            operation.showsPrintPanel = false
+        }
+        operation.jobTitle = currentURL?.deletingPathExtension().lastPathComponent ?? L("Documento", "Document")
         operation.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil)
     }
 
@@ -618,9 +652,9 @@ if CommandLine.arguments.count > 2, CommandLine.arguments[1] == "--check" {
         document.text.enumerateAttribute(.paragraphStyle, in: range) { value, _, _ in
             if let style = value as? NSParagraphStyle, !style.textBlocks.isEmpty { tableParagraphs += 1 }
         }
-        print("OK: \(document.text.length) caratteri, \(document.wordCount) parole, \(attachments) immagini, \(tableParagraphs) paragrafi in tabella")
+        print("OK: \(document.text.length) characters, \(document.wordCount) words, \(attachments) images, \(tableParagraphs) table paragraphs")
     } catch {
-        fputs("DOCX non leggibile: \(error.localizedDescription)\n", stderr)
+        fputs("Unreadable document: \(error.localizedDescription)\n", stderr)
         exit(1)
     }
 } else {
