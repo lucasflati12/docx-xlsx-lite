@@ -2,7 +2,7 @@
 # Builds a universal (Apple Silicon + Intel) app. Usage: bash build.sh ["/path/to/DOCX Lite.app"]
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")" && pwd)"
-APP="${1:-$HOME/Desktop/DOCX Lite.app}"
+APP="${1:-/private/tmp/docxlite-build/DOCX Lite.app}"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 for ARCH in arm64 x86_64; do

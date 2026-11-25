@@ -1,5 +1,6 @@
 """Create small, self-contained DOCX fixtures without third-party dependencies."""
-import base64
+import struct
+import zlib
 import pathlib
 import sys
 import zipfile
@@ -31,7 +32,16 @@ body += picture
 body += ''.join(f'<w:p><w:r><w:t>Paragrafo {i}. Un lettore piccolo, rapido e semplice per i documenti di ogni giorno.</w:t></w:r></w:p>' for i in range(1, 46))
 namespaces = '''xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"'''
 section = '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134"/></w:sectPr>'
-pixel = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==')
+# A valid PNG with checked CRCs; the previous literal had a corrupt IDAT checksum.
+def chunk(kind, data):
+    return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+pixel = (b'\x89PNG\r\n\x1a\n'
+         + chunk(b'IHDR', struct.pack('>IIBBBBB', 32, 24, 8, 6, 0, 0, 0))
+         + chunk(b'IDAT', zlib.compress((b'\x00' + b'\x30\x80\xe0\xff' * 32) * 24))
+         + chunk(b'IEND', b''))
+(out / 'image.png').write_bytes(pixel)
+(out / 'legacy.rtf').write_bytes(b'{\\rtf1\\ansi Legacy \\b bold\\b0 document.}')
+
 for name, paragraphs in [('rich.docx', body), ('empty.docx', '<w:p/>')]:
     with zipfile.ZipFile(out / name, 'w', zipfile.ZIP_DEFLATED) as z:
         z.writestr('[Content_Types].xml', content_types)
