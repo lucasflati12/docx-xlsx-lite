@@ -83,7 +83,9 @@ func scheduleReaderTests(_ reader: ReaderApp, fixture: URL) {
             // Probe the unmodified AppKit exporter separately from the image fix.
             let rawURL = fixture.deletingLastPathComponent().appendingPathComponent("native-writer.docx")
             do {
-                let raw = try doc.text.data(from: range, documentAttributes: [.documentType: NSAttributedString.DocumentType.officeOpenXML])
+                let probe = NSMutableAttributedString(attributedString: doc.text)
+                probe.removeAttribute(docxPackageKey, range: range)
+                let raw = try probe.data(from: range, documentAttributes: [.documentType: NSAttributedString.DocumentType.officeOpenXML])
                 try raw.write(to: rawURL)
                 let native = try WordDocument(url: rawURL)
                 var nativeImages = 0
@@ -114,7 +116,7 @@ func scheduleReaderTests(_ reader: ReaderApp, fixture: URL) {
                 if let style = value as? NSParagraphStyle, !style.textBlocks.isEmpty { reopenedTableParagraphs += 1 }
             }
             check(reopenedTableParagraphs >= 4, "Saved Word table reopens as native NSTextTable cells")
-            check(reader.rewriteWarningText.contains(L("tabelle complesse", "complex tables")), "Overwrite warning explicitly mentions complex tables")
+            check(!reader.needsRewriteWarning && doc.package?.unsupported.isEmpty == true, "Supported tables do not require an overwrite warning")
             reader.newBlank()
             check(reader.currentURL == nil && reader.window.title == L("Senza titolo", "Untitled"), "New blank untitled document")
             check(reader.textView.textContainer!.containerSize.width == 483, "New document uses A4 and margins")
@@ -433,6 +435,7 @@ func scheduleReaderTests(_ reader: ReaderApp, fixture: URL) {
             try writeDOCX(NSAttributedString(attachment: jpegAttachment), to: jpegURL, pageSize: NSSize(width: 595, height: 842), margin: 56)
             let savedJPEG = try archiveMember(jpegURL, "word/media/docxlite-0.jpg")
             check(savedJPEG == jpeg, "JPEG data is saved without lossy re-encoding")
+            passed += try runPreservationTests(reader, folder: fixture.deletingLastPathComponent(), imageData: imageData)
             runAsyncSaveTests(reader, fixture: fixture) { extra in
                 print("RESULT: \(passed + extra) passed, 0 failed")
                 print("ALL READER AND EDITOR TESTS PASSED")
@@ -600,4 +603,74 @@ private func runAsyncSaveTests(_ reader: ReaderApp, fixture: URL, completion: @e
         if case .failure = result { check(true, "Concurrent saves are rejected safely") }
         else { check(false, "Concurrent saves are rejected safely") }
     }
+}
+
+// Exercise the same attributed-string edits and snapshots used by background save.
+func runPreservationTests(_ reader: ReaderApp, folder: URL, imageData: Data) throws -> Int {
+    var passed = 0
+    func check(_ condition: @autoclosure () -> Bool, _ message: String) {
+        guard condition() else { fputs("FAIL: \(message)\n", stderr); exit(1) }
+        passed += 1; print("PASS: \(message)")
+    }
+    let source = folder.appendingPathComponent("retained.docx")
+    let original = try Data(contentsOf: source), doc = try WordDocument(url: source)
+    check(doc.package?.unsupported.isEmpty == true, "Headers, notes, comments and sections need no overwrite warning")
+    reader.display(doc, url: source)
+    check(!reader.needsRewriteWarning && reader.headerPreview.stringValue == "First page header" && reader.footerPreview.stringValue.contains("First page footer"), "First-page read-only header/footer previews")
+    check(!reader.headerPreview.isEditable && !reader.footerPreview.isEditable && doc.pageSize.width == 841.9 && doc.margin == 36, "Landscape geometry and read-only previews")
+    var anchors: [(DOCXAnchor, Int)] = []
+    doc.text.enumerateAttribute(docxAnchorKey, in: NSRange(location: 0, length: doc.text.length)) { value, range, _ in
+        if let anchor = value as? DOCXAnchor { anchors.append((anchor, range.location)) }
+    }
+    check(anchors.count == 12, "Import restores both comment ranges, three note references, bookmark and section break")
+    let indicators = anchors.filter { $0.0.visible }
+    check(indicators.count == 5 && indicators.allSatisfy { doc.text.attribute(.toolTip, at: $0.1, effectiveRange: nil) as? String == $0.0.detail && !$0.0.detail.isEmpty }, "Read-only comment and note indicators have tooltips")
+    check(indicators.filter { $0.0.kind != "commentReference" }.allSatisfy { (doc.text.attribute(.baselineOffset, at: $0.1, effectiveRange: nil) as? NSNumber)?.intValue == 3 }, "Footnote/endnote numbers appear as superscripts")
+    check(documentPlainText(doc.text).contains("A bold comment span and note.") && !documentPlainText(doc.text).contains("DOCXLITE"), "Plain text and word counts omit invisible anchors")
+    let tail = (reader.textView.string as NSString).range(of: "Editable tail.")
+    reader.textView.insertText("Edited elsewhere.", replacementRange: tail)
+    let image = NSTextAttachment(); image.fileWrapper = FileWrapper(regularFileWithContents: imageData)
+    image.attachmentCell = NSTextAttachmentCell(imageCell: NSImage(data: imageData)!)
+    reader.textView.textStorage!.append(NSAttributedString(attachment: image))
+    reader.textView.textStorage!.append(NSAttributedString(string: "\nNew heading\nNew list item\n", attributes: [.font: NSFont(name: "Arial", size: 12)!]))
+    let heading = (reader.textView.string as NSString).range(of: "New heading")
+    reader.textView.textStorage!.addAttribute(wordParagraphStyleKey, value: "Heading1", range: heading)
+    let list = NSMutableParagraphStyle(); list.textLists = [NSTextList(markerFormat: .decimal, options: 0)]; list.headIndent = 30
+    let listRange = (reader.textView.string as NSString).paragraphRange(for: (reader.textView.string as NSString).range(of: "New list item"))
+    reader.textView.textStorage!.addAttribute(.paragraphStyle, value: list, range: listRange)
+    let saved = folder.appendingPathComponent("retained-edited.docx")
+    try reader.writeDocument(to: saved)
+    let reopened = try WordDocument(url: saved)
+    check(documentPlainText(reopened.text).contains("Edited elsewhere."), "Unrelated edit survives package merge")
+    let boldRange = (reopened.text.string as NSString).range(of: "bold comment")
+    check((reopened.text.attribute(.font, at: boldRange.location, effectiveRange: nil) as? NSFont)?.fontDescriptor.symbolicTraits.contains(.bold) == true, "Comment spanning bold and plain runs retains formatting")
+    let second = folder.appendingPathComponent("retained-second.docx")
+    try writeDOCX(saveSnapshot(reopened.text), to: second, pageSize: reopened.pageSize, margin: reopened.margin)
+    reader.display(reopened, url: saved)
+    let deletion = (reader.textView.string as NSString).paragraphRange(for: (reader.textView.string as NSString).range(of: "Delete annotated paragraph"))
+    reader.textView.insertText("", replacementRange: deletion)
+    try reader.writeDocument(to: folder.appendingPathComponent("retained-deleted.docx"))
+    reader.textView.undoManager?.undo()
+    check(reader.textView.string.contains("Delete annotated paragraph"), "Deleting an annotated paragraph remains undoable")
+    try reader.writeDocument(to: folder.appendingPathComponent("retained-undone.docx"))
+    // Deleting only one boundary must also remove the incomplete range cleanly.
+    let partial = NSMutableAttributedString(attributedString: reopened.text)
+    var boundary: NSRange?
+    partial.enumerateAttribute(docxAnchorKey, in: NSRange(location: 0, length: partial.length)) { value, range, _ in
+        if let anchor = value as? DOCXAnchor, anchor.kind == "commentRangeStart", anchor.id == "1" { boundary = range }
+    }
+    partial.deleteCharacters(in: boundary!)
+    try writeDOCX(partial, to: folder.appendingPathComponent("retained-partial.docx"), pageSize: reopened.pageSize, margin: reopened.margin)
+    // The app holds the package even when all attributed text has been deleted.
+    reader.textView.insertText("", replacementRange: NSRange(location: 0, length: reader.textView.string.utf16.count))
+    try reader.writeDocument(to: folder.appendingPathComponent("retained-empty.docx"))
+    let empty = try WordDocument(url: folder.appendingPathComponent("retained-empty.docx"))
+    check(empty.package?.headerText == "First page header" || empty.package?.headerText.hasPrefix("Default page header") == true, "Deleting all body text retains package and final section")
+    let unsupported = try WordDocument(url: folder.appendingPathComponent("unsupported.docx"))
+    reader.display(unsupported, url: folder.appendingPathComponent("unsupported.docx"))
+    check(reader.needsRewriteWarning && [L("Revisioni e modifiche tracciate", "Tracked changes"), L("Controlli contenuto", "Content controls"), L("Equazioni", "Equations")].allSatisfy { reader.rewriteWarningText.contains($0) }, "Overwrite warning lists the detected unsupported features")
+    let unchanged = try Data(contentsOf: source)
+    check(unchanged == original, "Preservation tests leave original package unchanged")
+    reader.newBlank()
+    return passed
 }

@@ -26,6 +26,11 @@ extension XMLElement {
     func child(_ name: String) -> XMLElement? { children?.first { $0.localName == name } as? XMLElement }
     func kids(_ name: String) -> [XMLElement] { children?.compactMap { $0.localName == name ? $0 as? XMLElement : nil } ?? [] }
 }
+// Reuse the surrounding part's namespace prefix when adding OOXML nodes.
+func partElement(_ name: String, like context: XMLElement, text: String? = nil) -> XMLElement {
+    let prefix = (context.name ?? "").split(separator:":")
+    return XMLElement(name:prefix.count>1 ? String(prefix[0])+":"+name : name,stringValue:text)
+}
 func column(_ ref: String) -> Int { ref.prefix(while: { $0.isASCII && $0.isLetter }).uppercased().unicodeScalars.reduce(0) { $0 * 26 + Int($1.value) - 64 } }
 func rowNumber(_ ref: String) -> Int { Int(ref.drop(while: { $0.isLetter })) ?? 0 }
 func columnName(_ c: Int) -> String { var v = c, s = ""; while v > 0 { v -= 1; s = String(UnicodeScalar(65 + v % 26)!) + s; v /= 26 }; return s }
@@ -90,7 +95,7 @@ func styleSignature(_ e: XMLElement) -> String {
 struct Sheet { let name: String; let path: String; let hidden: Bool }
 struct Rendered { let html: String; let rows: Int; let columns: Int; let shownRows: Int }
 enum CellKind { case text, number, formula }
-struct SheetIndex { var cells: [Int: XMLElement] = [:]; var blankCells: [Int:XMLElement] = [:]; var hiddenRows = Set<Int>(); var maxRow = 0, maxCol = 0 }
+struct SheetIndex { var cells: [Int: XMLElement] = [:]; var blankCells: [Int:XMLElement] = [:]; var sharedMasters: [String:XMLElement] = [:]; var hiddenRows = Set<Int>(); var maxRow = 0, maxCol = 0 }
 
 /// The edit grammar intentionally accepts either decimal separator, without ambiguous grouping.
 func automaticNumber(_ input: String) -> Double? {
@@ -110,27 +115,117 @@ struct CellRange {
     var refs: [String] { (r1...r2).flatMap { r in (c1...c2).map { columnName($0)+String(r) } } }
 }
 
-/// Fill Down shifts relative row references; quoted strings and sheet names stay literal.
-func fillFormula(_ formula: String, down delta: Int, right horizontal: Int = 0) -> String {
-    let re = try! NSRegularExpression(pattern:"(?<![A-Za-z0-9_.])([$]?[A-Za-z]{1,3})([$]?)([1-9][0-9]{0,6})(?![A-Za-z0-9_!(])")
-    func shift(_ chunk: String) -> String {
-        let result = NSMutableString(string:chunk)
-        for m in re.matches(in:chunk,range:NSRange(chunk.startIndex...,in:chunk)).reversed() {
-            let ns = chunk as NSString
-            let colText = ns.substring(with:m.range(at:1)), absoluteRow = ns.substring(with:m.range(at:2)) == "$", absoluteCol = colText.hasPrefix("$")
-            let row = (Int(ns.substring(with:m.range(at:3))) ?? 0)+(absoluteRow ? 0 : delta)
-            let col = column(colText.replacingOccurrences(of:"$",with:""))+(absoluteCol ? 0 : horizontal)
-            result.replaceCharacters(in:m.range,with:row>0 && row<=1048576 && col>0 && col<=16384 ? (absoluteCol ? "$" : "")+columnName(col)+(absoluteRow ? "$" : "")+String(row) : "#REF!")
+// MARK: - Structural references and package transactions
+func gridActionTitle(rows: Bool, count: Int, deleting: Bool, after: Bool = false) -> String {
+    let n = count == 0 ? "%N" : String(count)
+    if deleting {
+        if count == 1 { return rows ? L("Elimina riga","Delete row") : L("Elimina colonna","Delete column") }
+        return rows ? L("Elimina \(n) righe","Delete \(n) rows") : L("Elimina \(n) colonne","Delete \(n) columns")
+    }
+    if rows { return after ? (count == 1 ? L("Inserisci 1 riga sotto","Insert 1 row below") : L("Inserisci \(n) righe sotto","Insert \(n) rows below")) : (count == 1 ? L("Inserisci 1 riga sopra","Insert 1 row above") : L("Inserisci \(n) righe sopra","Insert \(n) rows above")) }
+    return after ? (count == 1 ? L("Inserisci 1 colonna a destra","Insert 1 column to the right") : L("Inserisci \(n) colonne a destra","Insert \(n) columns to the right")) : (count == 1 ? L("Inserisci 1 colonna a sinistra","Insert 1 column to the left") : L("Inserisci \(n) colonne a sinistra","Insert \(n) columns to the left"))
+}
+struct GridChange {
+    let rows: Bool, at: Int, count: Int, deleting: Bool
+    var limit: Int { rows ? 1048576 : 16384 }
+    func point(_ n: Int, clamp: Bool = false) -> Int? {
+        if !deleting { return n>=at ? n+count : n }
+        if n<at { return n }; if n>=at+count { return n-count }; return clamp ? at : nil
+    }
+    func interval(_ lo: Int, _ hi: Int) -> (Int,Int)? {
+        if !deleting { return (lo>=at ? lo+count : lo,hi>=at ? hi+count : hi) }
+        let a = lo>=at && lo<at+count ? at+count : lo
+        let b = hi>=at && hi<at+count ? at-1 : hi
+        guard a<=b else { return nil }; return (a>=at+count ? a-count : a,b>=at+count ? b-count : b)
+    }
+}
+struct GridPoint {
+    var row: Int?, col: Int?, absoluteRow = false, absoluteCol = false
+    init?(_ text: String) {
+        let s = text.uppercased(), parts = s.split(separator:"$",omittingEmptySubsequences:true)
+        let clean = parts.joined()
+        let letters = String(clean.prefix(while: { $0.isLetter })), digits = String(clean.dropFirst(letters.count))
+        guard !clean.isEmpty, letters.isEmpty || letters.range(of:"^[A-Z]{1,3}$",options:.regularExpression) != nil,
+              digits.isEmpty || (Int(digits) ?? 0)>0 else { return nil }
+        col = letters.isEmpty ? nil : column(letters); row = digits.isEmpty ? nil : Int(digits)
+        absoluteCol = !letters.isEmpty && s.hasPrefix("$")
+        absoluteRow = !digits.isEmpty && (letters.isEmpty ? s.hasPrefix("$") : s.contains("$"+digits))
+        guard (col ?? 1)<=16384,(row ?? 1)<=1048576 else { return nil }
+    }
+    var text: String { (col.map { (absoluteCol ? "$" : "")+columnName($0) } ?? "")+(row.map { (absoluteRow ? "$" : "")+String($0) } ?? "") }
+}
+struct GridRef {
+    var first: GridPoint, last: GridPoint, range: Bool
+    init?(_ text: String) {
+        let parts = text.split(separator:":",omittingEmptySubsequences:false)
+        guard parts.count<=2,let a = GridPoint(String(parts[0])),let b = GridPoint(String(parts.last!)),
+              (a.row == nil) == (b.row == nil),(a.col == nil) == (b.col == nil),parts.count == 2 || (a.row != nil && a.col != nil) else { return nil }
+        first = a; last = b; range = parts.count == 2
+    }
+    var text: String { first.text+(range ? ":"+last.text : "") }
+    var top: Int { min(first.row ?? 1,last.row ?? 1) }; var left: Int { min(first.col ?? 1,last.col ?? 1) }
+    func shifted(_ change: GridChange, bounded: Bool = false) throws -> GridRef? {
+        let a = change.rows ? first.row : first.col, b = change.rows ? last.row : last.col
+        guard let x = a,let y = b else { return self }
+        guard let (lo,hi) = change.interval(min(x,y),max(x,y)) else { return nil }
+        if !bounded && !(min(x,y) == 1 && max(x,y) == change.limit) && hi>change.limit { throw failure(L("Lo spostamento supererebbe i limiti del foglio Excel.","The shift would exceed the Excel worksheet limits.")) }
+        guard lo<=change.limit else { return nil }
+        var result = self
+        let p = x<=y ? lo : min(change.limit,hi), q = x<=y ? min(change.limit,hi) : lo
+        if change.rows { result.first.row = p; result.last.row = q } else { result.first.col = p; result.last.col = q }
+        return result
+    }
+    func copied(down: Int, right: Int) -> GridRef? {
+        var r = self
+        if let n = r.first.row,!r.first.absoluteRow { r.first.row = n+down }; if let n = r.last.row,!r.last.absoluteRow { r.last.row = n+down }
+        if let n = r.first.col,!r.first.absoluteCol { r.first.col = n+right }; if let n = r.last.col,!r.last.absoluteCol { r.last.col = n+right }
+        for p in [r.first,r.last] { if (p.row ?? 1)<1 || (p.row ?? 1)>1048576 || (p.col ?? 1)<1 || (p.col ?? 1)>16384 { return nil } }
+        return r
+    }
+}
+enum RefScanner {
+    // Double-quoted Excel strings are handled separately; single quotes belong to sheet names.
+    static let regex = try! NSRegularExpression(pattern:"(?<![A-Za-z0-9_.$])(?:(('(?:[^']|'')+'|[\\p{L}_][\\p{L}0-9_.]*)!))?((?:[$]?[A-Za-z]{1,3}[$]?[1-9][0-9]{0,6})(?::[$]?[A-Za-z]{1,3}[$]?[1-9][0-9]{0,6})?|[$]?[A-Za-z]{1,3}:[$]?[A-Za-z]{1,3}|[$]?[1-9][0-9]{0,6}:[$]?[1-9][0-9]{0,6})(?![A-Za-z0-9_.]|\\s*\\()")
+    static func transform(_ input: String, _ replace: (String?,GridRef) throws -> String?) rethrows -> String {
+        let chars = Array(input); var i = 0, out = "", chunk = "", sheetQuote = false
+        func flush() throws {
+            let ns = chunk as NSString, matches = regex.matches(in:chunk,range:NSRange(location:0,length:ns.length))
+            let result = NSMutableString(string:chunk)
+            for m in matches.reversed() {
+                guard let ref = GridRef(ns.substring(with:m.range(at:3))) else { continue }
+                let rawSheet = m.range(at:2).location == NSNotFound ? nil : ns.substring(with:m.range(at:2))
+                if let replacement = try replace(rawSheet,ref) { result.replaceCharacters(in:m.range,with:(rawSheet.map { $0+"!" } ?? "")+replacement) }
+            }
+            out += result as String; chunk = ""
         }
-        return result as String
+        while i<chars.count {
+            if chars[i] == "'" { sheetQuote.toggle(); chunk.append(chars[i]); i += 1; continue }
+            if chars[i] == "\"" && !sheetQuote {
+                try flush(); out.append(chars[i]); i += 1
+                while i<chars.count { let ch = chars[i]; out.append(ch); i += 1; if ch == "\"" { if i<chars.count && chars[i] == "\"" { out.append(chars[i]); i += 1 } else { break } } }
+            } else { chunk.append(chars[i]); i += 1 }
+        }
+        try flush(); return out
     }
-    var out = "", chunk = "", quoted: Character?
-    for ch in formula {
-        if let quote = quoted { out.append(ch); if ch == quote { quoted = nil }; continue }
-        if ch == "\"" || ch == "'" { out += shift(chunk); chunk = ""; quoted = ch; out.append(ch) }
-        else { chunk.append(ch) }
+    static func sheetName(_ raw: String) -> String { raw.hasPrefix("'") ? String(raw.dropFirst().dropLast()).replacingOccurrences(of:"''",with:"'") : raw }
+    static func unquoted(_ text: String) -> String {
+        var out = "", quoted = false
+        for ch in text { if ch == "\"" { quoted.toggle() }; if !quoted { out.append(ch) } }; return out
     }
-    return out+shift(chunk)
+}
+func partTarget(_ base: String, _ target: String) -> String {
+    let path = target.hasPrefix("/") ? target : "/"+(base as NSString).deletingLastPathComponent+"/"+target
+    return String((path as NSString).standardizingPath.drop(while: { $0 == "/" }))
+}
+func relationshipsPart(_ path: String) -> String { (path as NSString).deletingLastPathComponent+"/_rels/"+(path as NSString).lastPathComponent+".rels" }
+func elements(_ root: XMLElement) -> [XMLElement] {
+    var result = [root], i = 0
+    while i<result.count { result += result[i].children?.compactMap { $0 as? XMLElement } ?? []; i += 1 }; return result
+}
+struct PackageSnapshot { let documents: [String:Data]; let removed: Set<String>; let memberNames: Set<String>; let dirty: Bool }
+
+func fillFormula(_ formula: String, down delta: Int, right horizontal: Int = 0) -> String {
+    RefScanner.transform(formula) { _,ref in ref.copied(down:delta,right:horizontal)?.text ?? "#REF!" }
 }
 
 /// Every document action owns a closed top-level group. Never mix Cocoa's per-event
@@ -147,12 +242,149 @@ final class SheetUndoManager: UndoManager {
     }
 }
 
+// MARK: - Charts (DrawingML in, SVG out)
+let chartNamespace = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+let drawingNamespace = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+let drawingMainNamespace = "http://schemas.openxmlformats.org/drawingml/2006/main"
+let relationshipNamespace = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+struct ChartSeries {
+    var name: String, labels: [String], values: [Double?], x: [Double?], color: String, markers: Bool
+}
+struct ChartModel {
+    var id: String, path: String, drawing: String, anchor: Int, title: String, kind: String, grouping: String
+    var series: [ChartSeries], frame: CGRect, lastRow: Int, lastCol: Int
+}
+struct GridGeometry {
+    var widths: [Int:Double] = [:], heights: [Int:Double] = [:], hiddenRows = Set<Int>(), hiddenCols = Set<Int>()
+    init(_ root: XMLElement) {
+        for col in root.child("cols")?.kids("col") ?? [] {
+            let lo = Int(col.attr("min")) ?? 1,hi = min(16384,Int(col.attr("max")) ?? 1); guard lo<=hi else { continue }
+            for c in lo...hi { widths[c] = min(620,max(48,(Double(col.attr("width")) ?? 12)*7+8)); if ["1","true"].contains(col.attr("hidden")) { hiddenCols.insert(c) } }
+        }
+        for row in root.child("sheetData")?.kids("row") ?? [] {
+            let r = Int(row.attr("r")) ?? 0
+            if let h = Double(row.attr("ht")),h>0 { heights[r] = h*4/3 }
+            if ["1","true"].contains(row.attr("hidden")) { hiddenRows.insert(r) }
+        }
+    }
+    func width(_ col: Int) -> Double { hiddenCols.contains(col) ? 0 : widths[col] ?? 110 }
+    func height(_ row: Int) -> Double { hiddenRows.contains(row) ? 0 : heights[row] ?? 27 }
+    func point(col: Int,row: Int,colOff: Double = 0,rowOff: Double = 0) -> CGPoint {
+        var x = 40.0,y = 66.0
+        if col>0 { for c in 1...min(col,16384) { x += width(c) } }; if row>0 { for r in 1...min(row,1048576) { y += height(r) } }
+        return CGPoint(x:x+colOff/9525,y:y+rowOff/9525)
+    }
+    func coordinate(_ pixel: Double, rows: Bool) -> (Int,Int) {
+        var remaining = max(0,pixel-(rows ? 66 : 40)),i = 1,limit = rows ? 1048576 : 16384
+        while i<limit { let n = rows ? height(i) : width(i); if n>0 && remaining<n { break }; remaining -= n; i += 1 }
+        return (i-1,Int((remaining*9525).rounded()))
+    }
+}
+func chartNumber(_ n: Double) -> String { String(format:"%.2f",locale:Locale(identifier:"en_US_POSIX"),n.isFinite ? n : 0) }
+let chartPalette = ["#4472C4","#ED7D31","#A5A5A5","#FFC000","#5B9BD5","#70AD47","#264478","#9E480E"]
+func chartSVG(_ chart: ChartModel) -> String {
+    let w = Double(chart.frame.width),h = Double(chart.frame.height)
+    func n(_ x: Double) -> String { chartNumber(x) }
+    func text(_ x: Double,_ y: Double,_ value: String,_ anchor: String = "middle",_ size: Int = 10) -> String { "<text x='\(n(x))' y='\(n(y))' text-anchor='\(anchor)' font-size='\(size)'>\(esc(value))</text>" }
+    var svg = "<svg xmlns='http://www.w3.org/2000/svg' width='100%' height='100%' viewBox='0 0 \(n(w)) \(n(h))' role='img' aria-label='\(esc(chart.title))' style='font-family:-apple-system,system-ui;color:#333'><title>\(esc(chart.title))</title><rect width='100%' height='100%' fill='white'/>"+text(w/2,24,chart.title,"middle",14)
+    guard chart.kind != "unsupported" else { return svg+text(w/2,h/2,L("Anteprima non disponibile per questo tipo di grafico","Preview unavailable for this chart type"),"middle",11)+"</svg>" }
+    let count = chart.series.map { $0.values.count }.max() ?? 0
+    guard count>0,!chart.series.isEmpty else { return svg+text(w/2,h/2,L("Nessun dato","No data"))+"</svg>" }
+    if chart.kind == "pie" || chart.kind == "doughnut" {
+        let s = chart.series[0], values = s.values.map { abs($0 ?? 0) },total = values.reduce(0,+)
+        let radius = max(15,min((w-155)/2,(h-55)/2)),cx = max(radius+10,(w-145)/2),cy = (h+25)/2,inner = chart.kind == "doughnut" ? radius*0.55 : 0
+        var angle = -Double.pi/2
+        for (i,v) in values.enumerated() where v>0 && total>0 {
+            let end = angle+v/total*2*Double.pi,mid = (angle+end)/2
+            func point(_ r: Double,_ a: Double) -> String { n(cx+r*cos(a))+" "+n(cy+r*sin(a)) }
+            // Two arcs also represent a complete, single-slice circle correctly.
+            var path = "M "+point(radius,angle)+" A \(n(radius)) \(n(radius)) 0 0 1 "+point(radius,mid)+" A \(n(radius)) \(n(radius)) 0 0 1 "+point(radius,end)
+            if inner>0 { path += " L "+point(inner,end)+" A \(n(inner)) \(n(inner)) 0 0 0 "+point(inner,mid)+" A \(n(inner)) \(n(inner)) 0 0 0 "+point(inner,angle)+" Z" } else { path += " L \(n(cx)) \(n(cy)) Z" }
+            let label = i<s.labels.count ? s.labels[i] : String(i+1),color = chartPalette[i%chartPalette.count]
+            svg += "<path data-mark='slice' d='\(path)' fill='\(color)' stroke='white'><title>\(esc(label)): \(esc(Book.general.string(from:NSNumber(value:v)) ?? String(v)))</title></path>"
+            angle = end
+        }
+        for i in values.indices { let label = i<s.labels.count ? s.labels[i] : String(i+1),y = 47+Double(i)*15; svg += "<rect x='\(n(w-137))' y='\(n(y-8))' width='9' height='9' fill='\(chartPalette[i%chartPalette.count])'/>"+text(w-122,y,String(label.prefix(20)),"start") }
+        return svg+"</svg>"
+    }
+    let stacked = chart.grouping.lowercased().contains("stacked"),percent = chart.grouping.lowercased().contains("percent")
+    var values = chart.series.map(\.values)
+    if percent {
+        for i in 0..<count {
+            let positive = values.reduce(0.0) { $0+max(0,i<$1.count ? $1[i] ?? 0 : 0) },negative = values.reduce(0.0) { $0+abs(min(0,i<$1.count ? $1[i] ?? 0 : 0)) }
+            for j in values.indices where i<values[j].count { if let v = values[j][i] { values[j][i] = v>=0 ? (positive>0 ? v/positive : 0) : (negative>0 ? v/negative : 0) } }
+        }
+    }
+    var low = 0.0,high = 0.0
+    for i in 0..<count { var pos = 0.0,neg = 0.0; for s in values { let v = i<s.count ? s[i] ?? 0 : 0; if stacked { if v>=0 { pos += v } else { neg += v } } else { pos = max(pos,v); neg = min(neg,v) } }; low = min(low,neg); high = max(high,pos) }
+    func ticks(_ minimum: Double,_ maximum: Double) -> (Double,Double,[Double]) {
+        let span = maximum>minimum ? maximum-minimum : max(1,abs(minimum)),raw = span/5,power = pow(10,floor(log10(max(raw,1e-200)))),unit = raw/power
+        let step = (unit<=1 ? 1.0 : unit<=2 ? 2 : unit<=5 ? 5 : 10)*power,a = floor(minimum/step)*step,b = ceil((maximum>minimum ? maximum : minimum+span)/step)*step
+        let count = min(20,max(1,Int(((b-a)/step).rounded())))
+        return (a,b,(0...count).map { a+Double($0)*step })
+    }
+    let (minimum,maximum,ys) = ticks(low,high),left = chart.kind == "bar" ? 85.0 : 53,right = w-20,top = 43.0,bottom = max(90,h-62)
+    func y(_ v: Double) -> Double { bottom-(v-minimum)/max(1e-200,maximum-minimum)*(bottom-top) }
+    func vx(_ v: Double) -> Double { left+(v-minimum)/max(1e-200,maximum-minimum)*(right-left) }
+    func label(_ v: Double) -> String { percent ? "\(Int((v*100).rounded()))%" : Book.general.string(from:NSNumber(value:v)) ?? String(v) }
+    for tick in ys {
+        if chart.kind == "bar" { svg += "<path d='M \(n(vx(tick))) \(n(top)) V \(n(bottom))' stroke='#e5e7eb' fill='none'/>"+text(vx(tick),bottom+16,label(tick)) }
+        else { svg += "<path d='M \(n(left)) \(n(y(tick))) H \(n(right))' stroke='#e5e7eb' fill='none'/>"+text(left-7,y(tick)+3,label(tick),"end") }
+    }
+    svg += "<path d='M \(n(left)) \(n(top)) V \(n(bottom)) H \(n(right))' stroke='#9ca3af' fill='none'/>"
+    let labels = chart.series.first?.labels ?? []
+    func cat(_ i: Int) -> String { i<labels.count ? labels[i] : String(i+1) }
+    if chart.kind == "column" || chart.kind == "bar" {
+        let step = (chart.kind == "bar" ? bottom-top : right-left)/Double(count),group = max(1,Double(chart.series.count))
+        var pos = [Double](repeating:0,count:count),neg = pos
+        for (j,s) in chart.series.enumerated() { for i in s.values.indices {
+            guard let value = values[j][i] else { continue }; let start = stacked ? (value>=0 ? pos[i] : neg[i]) : 0,end = start+value
+            if value>=0 { pos[i] = end } else { neg[i] = end }
+            let thickness = step*0.72/(stacked ? 1 : group),offset = step*0.14+(stacked ? 0 : Double(j)*thickness)
+            let rect: CGRect
+            if chart.kind == "bar" { rect = CGRect(x:min(vx(start),vx(end)),y:top+Double(i)*step+offset,width:abs(vx(end)-vx(start)),height:thickness) }
+            else { rect = CGRect(x:left+Double(i)*step+offset,y:min(y(start),y(end)),width:thickness,height:abs(y(end)-y(start))) }
+            svg += "<rect data-mark='bar' x='\(n(rect.minX))' y='\(n(rect.minY))' width='\(n(rect.width))' height='\(n(rect.height))' fill='\(s.color)'><title>\(esc(s.name)) · \(esc(cat(i))): \(esc(label(value)))</title></rect>"
+        } }
+        for i in stride(from:0,to:count,by:max(1,(count+7)/8)) { if chart.kind == "bar" { svg += text(left-6,top+(Double(i)+0.5)*step+3,String(cat(i).prefix(12)),"end") } else { svg += text(left+(Double(i)+0.5)*step,bottom+17,String(cat(i).prefix(14))) } }
+    } else if chart.kind == "scatter" {
+        let xs = chart.series.flatMap(\.x).compactMap { $0 },(xmin,xmax,xt) = ticks(xs.min() ?? 0,xs.max() ?? 1)
+        func x(_ v: Double) -> Double { left+(v-xmin)/max(1e-200,xmax-xmin)*(right-left) }
+        for v in xt { svg += text(x(v),bottom+17,label(v)) }
+        for s in chart.series { for i in 0..<min(s.x.count,s.values.count) { if let xx = s.x[i],let yy = s.values[i] { svg += "<circle data-mark='point' cx='\(n(x(xx)))' cy='\(n(y(yy)))' r='3' fill='\(s.color)'><title>\(esc(s.name)): \(esc(label(xx))), \(esc(label(yy)))</title></circle>" } } }
+    } else {
+        var cumulative = [Double](repeating:0,count:count)
+        for (j,s) in chart.series.enumerated() {
+            var path = "",started = false,areaTop: [CGPoint] = [],areaBase: [CGPoint] = []
+            for i in 0..<count {
+                guard i<values[j].count,let v = values[j][i] else { started = false; continue }
+                let x = left+Double(i)/Double(max(1,count-1))*(right-left),base = stacked ? cumulative[i] : 0,end = base+v
+                cumulative[i] = end; path += (started ? " L " : " M ")+n(x)+" "+n(y(end)); started = true
+                areaTop.append(CGPoint(x:x,y:y(end))); areaBase.append(CGPoint(x:x,y:y(base)))
+                if s.markers && chart.kind == "line" { svg += "<circle data-mark='point' cx='\(n(x))' cy='\(n(y(end)))' r='3' fill='\(s.color)'/>" }
+            }
+            if chart.kind == "area",let first = areaTop.first {
+                let polygon = ([first]+areaTop.dropFirst()+areaBase.reversed()).map { n($0.x)+","+n($0.y) }.joined(separator:" ")
+                svg += "<polygon data-mark='area' points='\(polygon)' fill='\(s.color)' fill-opacity='0.45' stroke='\(s.color)'/>"
+            } else { svg += "<path data-mark='line' d='\(path)' fill='none' stroke='\(s.color)' stroke-width='2'/>" }
+        }
+        for i in stride(from:0,to:count,by:max(1,(count+7)/8)) { svg += text(left+Double(i)/Double(max(1,count-1))*(right-left),bottom+17,String(cat(i).prefix(14))) }
+    }
+    var x = left
+    for s in chart.series {
+        svg += "<rect x='\(n(x))' y='\(n(h-23))' width='10' height='10' fill='\(s.color)'/>"+text(x+15,h-14,String(s.name.prefix(24)),"start")
+        x += min(180,Double(s.name.count)*6+35)
+    }
+    return svg+"</svg>"
+}
 final class Book {
     var url: URL
     var untitled = false
     var temporaryDirectory: URL?
     deinit { if let dir = temporaryDirectory { try? FileManager.default.removeItem(at:dir) } }
     var documents: [String: XMLDocument] = [:]
+    var removedMembers = Set<String>()
+    var originalMembers: Set<String>?
     var dirty = false
     var calculationTime = Date()
     var strings: [String] = []; var sheets: [Sheet] = []; var styles: [CellStyle] = []; var date1904 = false
@@ -212,6 +444,8 @@ final class Book {
         return nil
     }
     func xml(_ member: String) throws -> XMLDocument {
+        if let doc = documents[member] { return doc }
+        guard !removedMembers.contains(member) else { throw failure(L("Parte del file eliminata.","Package part was deleted.")) }
         let process = Process(); process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
         let escaped = member.replacingOccurrences(of: "[", with: "\\[").replacingOccurrences(of: "*", with: "\\*").replacingOccurrences(of: "?", with: "\\?")
         process.arguments = ["-p", url.path, escaped]
@@ -224,6 +458,50 @@ final class Book {
         let path = sheets[index].path
         if let doc = documents[path] { return doc }
         let doc = try xml(path); documents[path] = doc; return doc
+    }
+    func part(_ path: String) throws -> XMLDocument {
+        if let doc = documents[path] { return doc }; let doc = try xml(path); documents[path] = doc; return doc
+    }
+    func members() throws -> Set<String> {
+        if originalMembers == nil {
+            let p = Process(); p.executableURL = URL(fileURLWithPath:"/usr/bin/unzip"); p.arguments = ["-Z","-1",url.path]
+            let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice; try p.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
+            guard p.terminationStatus == 0 else { throw failure(L("Impossibile leggere il pacchetto XLSX.","Could not read the XLSX package.")) }
+            originalMembers = Set(String(decoding:data,as:UTF8.self).split(separator:"\n").map(String.init))
+        }
+        return (originalMembers ?? []).union(documents.keys).subtracting(removedMembers)
+    }
+    func packageSnapshot() throws -> PackageSnapshot { PackageSnapshot(documents:documents.mapValues { $0.xmlData },removed:removedMembers,memberNames:try members(),dirty:dirty) }
+    func restorePackage(_ state: PackageSnapshot) throws {
+        let discarded = try members().subtracting(state.memberNames)
+        documents = try state.documents.mapValues { data in
+            let doc = try XMLDocument(data:data,options:[.nodePreserveWhitespace,.nodeLoadExternalEntitiesNever])
+            // Foundation defaults an omitted standalone declaration to yes on reparse.
+            // Restore its serialized spelling too; copying XMLDocument also mutates that flag.
+            let header = String((String(data:data,encoding:.utf8) ?? String(data:data,encoding:.utf16) ?? "").prefix(200).prefix(while:{ $0 != ">" }))
+            doc.isStandalone = header.range(of:"standalone\\s*=\\s*[\"']yes[\"']",options:.regularExpression) != nil
+            return doc
+        }
+        removedMembers = state.removed.union(discarded); dirty = state.dirty; if let styles = documents["xl/styles.xml"] { readStyles(styles) }; invalidate()
+    }
+    func linked(_ path: String, type: String) throws -> [(String,String)] {
+        let rp = relationshipsPart(path)
+        guard try members().contains(rp) else { return [] }
+        return try part(rp).rootElement()?.kids("Relationship").filter { $0.attr("Type").hasSuffix("/"+type) && $0.attr("TargetMode") != "External" }.map { ($0.attr("Id"),partTarget(path,$0.attr("Target"))) } ?? []
+    }
+    func preparePackage() throws {
+        let names = try members()
+        for s in sheets { _ = try sheetDocument(sheets.firstIndex(where:{ $0.path == s.path })!); if names.contains(relationshipsPart(s.path)) { _ = try part(relationshipsPart(s.path)) } }
+        for name in names where name == "xl/workbook.xml" || name == "xl/_rels/workbook.xml.rels" || name == "[Content_Types].xml" || name.hasPrefix("xl/tables/") && name.hasSuffix(".xml") || name.hasPrefix("xl/charts/") && (name.hasSuffix(".xml") || name.hasSuffix(".rels")) || name.hasPrefix("xl/drawings/") && (name.hasSuffix(".xml") || name.hasSuffix(".rels")) { _ = try part(name) }
+    }
+    func rewrite(_ text: String, context: Int?, target: Int, change: GridChange) throws -> String {
+        try RefScanner.transform(text) { rawSheet, ref in
+            let applies: Bool
+            if let rawSheet { applies = RefScanner.sheetName(rawSheet).caseInsensitiveCompare(sheets[target].name) == .orderedSame }
+            else { applies = context == target }
+            return applies ? try ref.shifted(change)?.text ?? "#REF!" : nil
+        }
     }
     func style(_ cell: XMLElement) -> CellStyle {
         let idx = Int(cell.attribute(forName: "s")?.stringValue ?? "") ?? 0
@@ -251,7 +529,10 @@ final class Book {
         }
     }
     /// The formula text of a cell that this app can calculate itself (not shared/array formulas).
-    func formulaText(_ cell: XMLElement) -> String? {
+    func formulaText(_ cell: XMLElement, sheet: Int? = nil) -> String? {
+        if let f = cell.child("f"), f.attr("t") == "shared", (f.stringValue ?? "").isEmpty, let sheet, let master = try? index(sheet).sharedMasters[f.attr("si")], let mf = master.child("f") {
+            return fillFormula(mf.stringValue ?? "",down:rowNumber(cell.attr("r"))-rowNumber(master.attr("r")),right:column(cell.attr("r"))-column(master.attr("r")))
+        }
         guard let f = cell.child("f"), let text = f.stringValue, !text.isEmpty, !["array", "dataTable"].contains(f.attr("t")) else { return nil }
         return text
     }
@@ -282,6 +563,7 @@ final class Book {
             for cell in row.kids("c") {
                 let ref = cell.attr("r"); c = ref.isEmpty ? c + 1 : column(ref)
                 guard c > 0 else { continue }
+                if let f = cell.child("f"), f.attr("t") == "shared", !(f.stringValue ?? "").isEmpty { result.sharedMasters[f.attr("si")] = cell }
                 if cell.child("v") == nil && cell.child("is") == nil && cell.child("f") == nil { result.blankCells[cellKey(r,c)] = cell; if !cell.attr("s").isEmpty && cell.attr("s") != "0" { result.maxRow = max(result.maxRow,r); result.maxCol = max(result.maxCol,c) }; continue }
                 result.cells[cellKey(r, c)] = cell; result.maxRow = max(result.maxRow, r); result.maxCol = max(result.maxCol, c)
             }
@@ -291,7 +573,7 @@ final class Book {
     }
     /// Value of a formula cell computed by this app; throws when the formula uses something unsupported.
     func computed(_ cell: XMLElement, sheet: Int) throws -> FValue {
-        guard let text = formulaText(cell) else { throw FormulaUnsupported() }
+        guard let text = formulaText(cell,sheet:sheet) else { throw FormulaUnsupported() }
         let ref = cell.attr("r"), key = sheet << 40 | cellKey(rowNumber(ref), column(ref))
         if let cached = memo[key] { return cached }
         guard !evaluating.contains(key) else { return .error("#REF!") }
@@ -334,7 +616,7 @@ final class Book {
     }
     func raw(_ sheet: Int, _ ref: String) throws -> String {
         guard let cell = try cell(sheet,ref) else { return "" }
-        if let f = cell.child("f") { return "=" + (f.stringValue ?? "") }
+        if let f = cell.child("f") { return "=" + (formulaText(cell,sheet:sheet) ?? f.stringValue ?? "") }
         return try value(sheet,rowNumber(ref),column(ref)).text
     }
     func automaticEdit(_ sheet: Int, _ ref: String, _ text: String) throws -> CellEdit {
@@ -365,7 +647,7 @@ final class Book {
             if let saved = snapshot.cell {
                 let row: XMLElement
                 if let existing = rows[r] { row = existing }
-                else { row = XMLElement(name:"row"); row.set("r",String(r)); let at = (data.children ?? []).firstIndex { (Int($0.attr("r")) ?? 0)>r } ?? data.childCount; data.insertChild(row,at:at); rows[r] = row }
+                else { row = partElement("row",like:data); row.set("r",String(r)); let at = (data.children ?? []).firstIndex { (Int($0.attr("r")) ?? 0)>r } ?? data.childCount; data.insertChild(row,at:at); rows[r] = row }
                 let at = (row.children ?? []).firstIndex { column($0.attr("r"))>c } ?? row.childCount
                 row.insertChild(saved.copy() as! XMLElement,at:at)
             } else if !snapshot.rowExisted, let row = rows[r], row.kids("c").isEmpty { row.detach(); rows.removeValue(forKey:r) }
@@ -378,7 +660,7 @@ final class Book {
     /// Preflight the complete batch before changing XML. A rejected paste cannot leave partial edits.
     func applyEdits(_ index: Int, _ edits: [CellEdit]) throws {
         let doc = try sheetDocument(index)
-        guard doc.nodes("/worksheet/sheetProtection").isEmpty else { throw failure(L("Questo foglio è protetto. Rimuovi la protezione in Excel prima di modificarlo.", "This sheet is protected. Remove the protection in Excel before editing it.")) }
+        guard doc.rootElement()?.child("sheetProtection") == nil else { throw failure(L("Questo foglio è protetto. Rimuovi la protezione in Excel prima di modificarlo.", "This sheet is protected. Remove the protection in Excel before editing it.")) }
         guard let data = doc.rootElement()?.child("sheetData") else { return }
         let idx = try self.index(index)
         for edit in edits {
@@ -394,17 +676,17 @@ final class Book {
             let r = rowNumber(edit.ref), col = column(edit.ref), key = cellKey(r,col)
             let row: XMLElement
             if let existing = rows[r] { row = existing }
-            else { row = XMLElement(name:"row"); row.set("r",String(r)); let place = (data.children ?? []).firstIndex { (Int($0.attr("r")) ?? 0)>r } ?? data.childCount; data.insertChild(row,at:place); rows[r] = row }
+            else { row = partElement("row",like:data); row.set("r",String(r)); let place = (data.children ?? []).firstIndex { (Int($0.attr("r")) ?? 0)>r } ?? data.childCount; data.insertChild(row,at:place); rows[r] = row }
             let c: XMLElement
             if let existing = cells[key] { c = existing }
-            else { c = XMLElement(name:"c"); c.set("r",edit.ref); let place = (row.children ?? []).firstIndex { column($0.attr("r"))>col } ?? row.childCount; row.insertChild(c,at:place); cells[key] = c }
+            else { c = partElement("c",like:row); c.set("r",edit.ref); let place = (row.children ?? []).firstIndex { column($0.attr("r"))>col } ?? row.childCount; row.insertChild(c,at:place); cells[key] = c }
             for node in c.kids("f") + c.kids("v") + c.kids("is") { node.detach() }; c.removeAttribute(forName:"t")
             if !edit.value.isEmpty {
                 switch edit.kind {
-                case .formula: c.addChild(XMLElement(name:"f",stringValue:normalizeFormula(edit.value)))
-                case .number: c.addChild(XMLElement(name:"v",stringValue:edit.value))
+                case .formula: c.addChild(partElement("f",like:c,text:normalizeFormula(edit.value)))
+                case .number: c.addChild(partElement("v",like:c,text:edit.value))
                 case .text:
-                    c.set("t","inlineStr"); let inline = XMLElement(name:"is"), t = XMLElement(name:"t",stringValue:edit.value); t.set("xml:space","preserve"); inline.addChild(t); c.addChild(inline)
+                    c.set("t","inlineStr"); let inline = partElement("is",like:c), t = partElement("t",like:c,text:edit.value); t.set("xml:space","preserve"); inline.addChild(t); c.addChild(inline)
                 }
             }
         }
@@ -547,6 +829,476 @@ final class Book {
         if try numeric(r,c-1) { var first = c-1; while try numeric(r,first-1) { first -= 1 }; return "="+function+"("+columnName(first)+String(r)+":"+columnName(c-1)+String(r)+")" }
         throw failure(L("Non ci sono numeri contigui sopra o a sinistra della cella.","There are no contiguous numbers above or to the left of this cell."))
     }
+    func nextPart(_ prefix: String) throws -> String {
+        let used = try members(); var i = 1; while used.contains(prefix+String(i)+".xml") { i += 1 }; return prefix+String(i)+".xml"
+    }
+    func contentType(_ path: String, _ type: String) throws {
+        let root = try part("[Content_Types].xml").rootElement()!
+        if root.kids("Override").contains(where:{ $0.attr("PartName") == "/"+path }) { return }
+        let e = partElement("Override",like:root); e.set("PartName","/"+path); e.set("ContentType",type); root.addChild(e)
+    }
+    func addRelationship(_ source: String, target: String, type: String) throws -> String {
+        let path = relationshipsPart(source),doc: XMLDocument
+        if try members().contains(path) { doc = try part(path) }
+        else { doc = try XMLDocument(xmlString:"<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'/>",options:[]); documents[path] = doc }
+        let root = doc.rootElement()!,used = Set(root.kids("Relationship").map { $0.attr("Id") }); var i = 1; while used.contains("rId\(i)") { i += 1 }
+        var a = (source as NSString).deletingLastPathComponent.split(separator:"/").map(String.init),b = target.split(separator:"/").map(String.init)
+        while !a.isEmpty && !b.isEmpty && a[0] == b[0] { a.removeFirst(); b.removeFirst() }
+        let relative = (Array(repeating:"..",count:a.count)+b).joined(separator:"/"),e = partElement("Relationship",like:root)
+        e.set("Id","rId\(i)"); e.set("Type",relationshipNamespace+"/"+type); e.set("Target",relative); root.addChild(e)
+        return "rId\(i)"
+    }
+    func markerXML(_ tag: String, col: Int,row: Int,colOff: Int = 0,rowOff: Int = 0) -> String {
+        "<xdr:\(tag)><xdr:col>\(col)</xdr:col><xdr:colOff>\(colOff)</xdr:colOff><xdr:row>\(row)</xdr:row><xdr:rowOff>\(rowOff)</xdr:rowOff></xdr:\(tag)>"
+    }
+    @discardableResult func createChart(_ sheet: Int, range: CellRange, kind: String) throws -> String {
+        try editable(sheet)
+        guard ["column","bar","line","pie"].contains(kind),range.count>1,range.count<=200000 else { throw failure(L("Seleziona un intervallo con dati per il grafico.","Select a data range for the chart.")) }
+        let backup = try packageSnapshot()
+        do {
+            let first = try (range.c1...range.c2).map { try value(sheet,range.r1,$0) }
+            let header = first.contains { if case .text(let s) = $0 { return !s.isEmpty }; return false } && first.allSatisfy { if case .text = $0 { return true }; if case .empty = $0 { return true }; return false }
+            let start = range.r1+(header ? 1 : 0); guard start<=range.r2 else { throw failure(L("L'intervallo contiene solo intestazioni.","The range only contains headers.")) }
+            let firstCol = try (start...range.r2).map { try value(sheet,$0,range.c1) }
+            let categories = range.c1<range.c2 && firstCol.contains { if case .text = $0 { return true }; return false } && firstCol.allSatisfy { if case .text = $0 { return true }; if case .empty = $0 { return true }; return false }
+            var columns: [Int] = []
+            for c in (range.c1+(categories ? 1 : 0))...range.c2 { if try (start...range.r2).contains(where:{ if case .number = try value(sheet,$0,c) { return true }; return false }) { columns.append(c) } }
+            if kind == "pie" { columns = Array(columns.prefix(1)) }
+            guard !columns.isEmpty else { throw failure(L("L'intervallo non contiene serie numeriche.","The range contains no numeric series.")) }
+            let sheetName = "'"+sheets[sheet].name.replacingOccurrences(of:"'",with:"''")+"'!"
+            func reference(_ c: Int,_ r1: Int,_ r2: Int) -> String { sheetName+"$"+columnName(c)+"$\(r1):$"+columnName(c)+"$\(r2)" }
+            func cache(_ tag: String,_ strings: [String?],numeric: Bool) -> String {
+                "<c:\(tag)>"+(numeric ? "<c:formatCode>General</c:formatCode>" : "")+"<c:ptCount val='\(strings.count)'/>"+strings.enumerated().compactMap { i,s in s.map { "<c:pt idx='\(i)'><c:v>\(esc($0))</c:v></c:pt>" } }.joined()+"</c:\(tag)>"
+            }
+            var seriesXML = ""
+            for (j,c) in columns.enumerated() {
+                let name = header ? try raw(sheet,columnName(c)+String(range.r1)) : L("Serie \(j+1)","Series \(j+1)")
+                let tx = header ? "<c:tx><c:strRef><c:f>\(esc(sheetName+"$"+columnName(c)+"$\(range.r1)"))</c:f>\(cache("strCache",[name],numeric:false))</c:strRef></c:tx>" : "<c:tx><c:v>\(esc(name))</c:v></c:tx>"
+                let labels: [String?] = try (start...range.r2).map { categories ? try cell(sheet,columnName(range.c1)+String($0)).map { display($0,sheet:sheet) } ?? "" : String($0-start+1) }
+                let cat = categories ? "<c:cat><c:strRef><c:f>\(esc(reference(range.c1,start,range.r2)))</c:f>\(cache("strCache",labels,numeric:false))</c:strRef></c:cat>" : "<c:cat>\(cache("strLit",labels,numeric:false))</c:cat>"
+                let vals: [String?] = try (start...range.r2).map { r in if case .number(let n) = try value(sheet,r,c),n.isFinite { return FValue.number(n).text }; return nil }
+                let val = "<c:val><c:numRef><c:f>\(esc(reference(c,start,range.r2)))</c:f>\(cache("numCache",vals,numeric:true))</c:numRef></c:val>"
+                let marker = kind == "line" ? "<c:marker><c:symbol val='circle'/><c:size val='5'/></c:marker>" : ""
+                seriesXML += "<c:ser><c:idx val='\(j)'/><c:order val='\(j)'/>"+tx+"<c:spPr><a:solidFill><a:srgbClr val='\(String(chartPalette[j%chartPalette.count].dropFirst()))'/></a:solidFill></c:spPr>"+marker+cat+val+(kind == "line" ? "<c:smooth val='0'/>" : "")+"</c:ser>"
+            }
+            let title = columns.count == 1 && header ? try raw(sheet,columnName(columns[0])+String(range.r1)) : L("Grafico","Chart")
+            let titleXML = "<c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>\(esc(title))</a:t></a:r></a:p></c:rich></c:tx><c:overlay val='0'/></c:title>"
+            let tag = kind == "line" ? "lineChart" : kind == "pie" ? "pieChart" : "barChart"
+            let prefix = tag == "barChart" ? "<c:barDir val='\(kind == "bar" ? "bar" : "col")'/><c:grouping val='clustered'/>" : tag == "lineChart" ? "<c:grouping val='standard'/>" : ""
+            let axes = kind == "pie" ? "" : "<c:catAx><c:axId val='100001'/><c:scaling><c:orientation val='minMax'/></c:scaling><c:delete val='0'/><c:axPos val='\(kind == "bar" ? "l" : "b")'/><c:tickLblPos val='nextTo'/><c:crossAx val='100002'/><c:crosses val='autoZero'/><c:auto val='1'/><c:lblAlgn val='ctr'/><c:lblOffset val='100'/></c:catAx><c:valAx><c:axId val='100002'/><c:scaling><c:orientation val='minMax'/></c:scaling><c:delete val='0'/><c:axPos val='\(kind == "bar" ? "b" : "l")'/><c:majorGridlines/><c:numFmt formatCode='General' sourceLinked='1'/><c:tickLblPos val='nextTo'/><c:crossAx val='100001'/><c:crosses val='autoZero'/><c:crossBetween val='between'/></c:valAx>"
+            let tail = kind == "line" ? "<c:marker val='1'/><c:smooth val='0'/>" : kind == "pie" ? "<c:firstSliceAng val='0'/>" : "<c:gapWidth val='150'/><c:overlap val='0'/>"
+            let path = try nextPart("xl/charts/chart")
+            let xml = "<c:chartSpace xmlns:c='\(chartNamespace)' xmlns:a='\(drawingMainNamespace)'><c:chart>"+titleXML+"<c:autoTitleDeleted val='0'/><c:plotArea><c:layout/><c:\(tag)>"+prefix+"<c:varyColors val='\(kind == "pie" ? "1" : "0")'/>"+seriesXML+tail+(kind == "pie" ? "" : "<c:axId val='100001'/><c:axId val='100002'/>")+"</c:\(tag)>"+axes+"</c:plotArea><c:legend><c:legendPos val='b'/><c:overlay val='0'/></c:legend><c:plotVisOnly val='1'/><c:dispBlanksAs val='gap'/></c:chart></c:chartSpace>"
+            documents[path] = try XMLDocument(xmlString:xml,options:[]); try contentType(path,"application/vnd.openxmlformats-officedocument.drawingml.chart+xml")
+            let sheetRoot = try sheetDocument(sheet).rootElement()!,drawing: String
+            if let old = try linked(sheets[sheet].path,type:"drawing").first { drawing = old.1 }
+            else {
+                drawing = try nextPart("xl/drawings/drawing"); documents[drawing] = try XMLDocument(xmlString:"<xdr:wsDr xmlns:xdr='\(drawingNamespace)' xmlns:a='\(drawingMainNamespace)'/>",options:[])
+                let id = try addRelationship(sheets[sheet].path,target:drawing,type:"drawing"),node = partElement("drawing",like:sheetRoot); node.addNamespace(XMLNode.namespace(withName:"r",stringValue:relationshipNamespace) as! XMLNode); node.set("r:id",id)
+                let after = ["legacyDrawing","legacyDrawingHF","picture","oleObjects","controls","webPublishItems","tableParts","extLst"]
+                let at = (sheetRoot.children ?? []).firstIndex { after.contains($0.localName ?? "") } ?? sheetRoot.childCount; sheetRoot.insertChild(node,at:at)
+                try contentType(drawing,"application/vnd.openxmlformats-officedocument.drawing+xml")
+            }
+            let rid = try addRelationship(drawing,target:path,type:"chart"),dr = try part(drawing).rootElement()!
+            let id = (elements(dr).filter { $0.localName == "cNvPr" }.compactMap { Int($0.attr("id")) }.max() ?? 0)+1
+            let fromCol = min(16376,range.c2+1),fromRow = min(1048561,max(0,range.r1-1))
+            let anchorXML = "<xdr:twoCellAnchor xmlns:xdr='\(drawingNamespace)' xmlns:a='\(drawingMainNamespace)' xmlns:c='\(chartNamespace)' xmlns:r='\(relationshipNamespace)' editAs='oneCell'>"+markerXML("from",col:fromCol,row:fromRow)+markerXML("to",col:fromCol+6,row:fromRow+12)+"<xdr:graphicFrame macro=''><xdr:nvGraphicFramePr><xdr:cNvPr id='\(id)' name='\(esc(L("Grafico \(id)","Chart \(id)")))'/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x='0' y='0'/><a:ext cx='0' cy='0'/></xdr:xfrm><a:graphic><a:graphicData uri='\(chartNamespace)'><c:chart r:id='\(rid)'/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor>"
+            let anchor = try XMLElement(xmlString:anchorXML),at = (dr.children ?? []).firstIndex { $0.localName == "extLst" } ?? dr.childCount; dr.insertChild(anchor,at:at)
+            dirty = true; invalidate()
+            return drawing+"#\((dr.children?.compactMap { $0 as? XMLElement } ?? []).firstIndex(where:{ $0 === anchor })!)"
+        } catch { try restorePackage(backup); throw error }
+    }
+    func chartAnchor(_ sheet: Int, id: String) throws -> (ChartModel,XMLElement,XMLElement) {
+        guard let model = try readCharts(sheet).first(where:{ $0.id == id }),let root = try part(model.drawing).rootElement() else { throw failure(L("Grafico non trovato.","Chart not found.")) }
+        let children = root.children?.compactMap { $0 as? XMLElement } ?? []
+        guard children.indices.contains(model.anchor) else { throw failure(L("Ancoraggio del grafico non valido.","Invalid chart anchor.")) }; return (model,root,children[model.anchor])
+    }
+    func setChartFrame(_ sheet: Int, id: String, frame: CGRect) throws {
+        try editable(sheet)
+        guard frame.minX.isFinite,frame.minY.isFinite,frame.width.isFinite,frame.height.isFinite,frame.width>=120,frame.height>=100 else { throw failure(L("Dimensioni del grafico non valide.","Invalid chart dimensions.")) }
+        let (_,root,old) = try chartAnchor(sheet,id:id),geometry = GridGeometry(try sheetDocument(sheet).rootElement()!)
+        let x1 = geometry.coordinate(max(40,frame.minX),rows:false),y1 = geometry.coordinate(max(66,frame.minY),rows:true),x2 = geometry.coordinate(max(40,frame.minX)+frame.width,rows:false),y2 = geometry.coordinate(max(66,frame.minY)+frame.height,rows:true)
+        let node = try XMLElement(xmlString:"<xdr:twoCellAnchor xmlns:xdr='\(drawingNamespace)' xmlns:a='\(drawingMainNamespace)' xmlns:c='\(chartNamespace)' xmlns:r='\(relationshipNamespace)' editAs='oneCell'>"+markerXML("from",col:x1.0,row:y1.0,colOff:x1.1,rowOff:y1.1)+markerXML("to",col:x2.0,row:y2.0,colOff:x2.1,rowOff:y2.1)+"</xdr:twoCellAnchor>")
+        for child in old.children?.compactMap({ $0 as? XMLElement }) ?? [] where !["from","to","pos","ext"].contains(child.localName ?? "") { node.addChild(child.copy() as! XMLElement) }
+        let at = (root.children ?? []).firstIndex { $0 === old }!; old.detach(); root.insertChild(node,at:at); dirty = true
+    }
+    func removePackagePart(_ path: String) throws {
+        documents.removeValue(forKey:path); removedMembers.insert(path)
+        if let root = try part("[Content_Types].xml").rootElement() { for e in root.kids("Override") where e.attr("PartName") == "/"+path { e.detach() } }
+    }
+    func deleteChart(_ sheet: Int, id: String) throws {
+        try editable(sheet); let (model,root,anchor) = try chartAnchor(sheet,id:id)
+        let rid = elements(anchor).first(where:{ $0.localName == "chart" })?.attr("r:id") ?? ""
+        anchor.detach()
+        if !elements(root).contains(where:{ $0.localName == "chart" && $0.attr("r:id") == rid }),let rels = try part(relationshipsPart(model.drawing)).rootElement() { rels.kids("Relationship").filter { $0.attr("Id") == rid }.forEach { $0.detach() } }
+        if root.children?.contains(where:{ $0 is XMLElement && $0.localName != "extLst" }) != true {
+            try sheetDocument(sheet).rootElement()?.child("drawing")?.detach()
+            if let rels = try part(relationshipsPart(sheets[sheet].path)).rootElement() { rels.kids("Relationship").filter { partTarget(sheets[sheet].path,$0.attr("Target")) == model.drawing }.forEach { $0.detach() } }
+            try removePackagePart(model.drawing); try removePackagePart(relationshipsPart(model.drawing))
+        }
+        var referenced = false
+        for path in try members() where path.hasSuffix(".rels") {
+            let source = ((path as NSString).deletingLastPathComponent as NSString).deletingLastPathComponent+"/"+String((path as NSString).lastPathComponent.dropLast(5))
+            if try part(path).rootElement()?.kids("Relationship").contains(where:{ $0.attr("Type").hasSuffix("/chart") && partTarget(source,$0.attr("Target")) == model.path }) == true { referenced = true; break }
+        }
+        if !referenced { try removePackagePart(model.path); let rel = relationshipsPart(model.path); if try members().contains(rel) { try removePackagePart(rel) } }
+        dirty = true; invalidate()
+    }
+    func chartReference(_ text: String, sheet: Int) throws -> [(FValue,String)]? {
+        // An intentionally deleted reference must never revive stale cached points.
+        if text.trimmingCharacters(in:.whitespacesAndNewlines).hasSuffix("#REF!") { return [] }
+        var parsed: (Int,GridRef)?
+        let source = text.hasPrefix("=") ? String(text.dropFirst()) : text
+        _ = RefScanner.transform(source) { raw,ref in
+            let canonical = (raw.map { $0+"!" } ?? "")+ref.text
+            guard canonical.caseInsensitiveCompare(source) == .orderedSame else { return nil }
+            let target = raw.flatMap { name in sheets.firstIndex { $0.name.caseInsensitiveCompare(RefScanner.sheetName(name)) == .orderedSame } } ?? (raw == nil ? sheet : -1)
+            if target>=0 { parsed = (target,ref) }; return nil
+        }
+        guard let (i,ref) = parsed else { return nil }; let idx = try index(i)
+        let r1 = ref.top,r2 = max(ref.first.row ?? max(1,idx.maxRow),ref.last.row ?? max(1,idx.maxRow))
+        let c1 = ref.left,c2 = max(ref.first.col ?? max(1,idx.maxCol),ref.last.col ?? max(1,idx.maxCol))
+        guard (r2-r1+1)*(c2-c1+1)<=200000 else { return nil }
+        var result: [(FValue,String)] = []
+        for r in r1...r2 { for c in c1...c2 {
+            let cell = idx.cells[cellKey(r,c)]
+            if let cell,cell.child("f") != nil,(try? computed(cell,sheet:i)) == nil,(cell.child("v")?.stringValue ?? "").isEmpty { result.append((.error("#UNSUPPORTED!"),"")) }
+            else { let v = try value(i,r,c); result.append((v,cell.map { display($0,sheet:i) } ?? "")) }
+        } }; return result
+    }
+    func chartCache(_ container: XMLElement?) -> [String?] {
+        guard let container else { return [] }
+        let points = container.kids("pt"), count = min(200000,max(Int(container.child("ptCount")?.attr("val") ?? "") ?? 0,(points.compactMap { Int($0.attr("idx")) }.max() ?? -1)+1))
+        guard count>0 else { return [] }; var result = [String?](repeating:nil,count:count)
+        for p in points { if let i = Int(p.attr("idx")),result.indices.contains(i) { result[i] = p.child("v")?.stringValue } }; return result
+    }
+    func chartValues(_ source: XMLElement?, sheet: Int, numeric: Bool) throws -> [(FValue,String)] {
+        guard let source else { return [] }
+        let ref = source.child("numRef") ?? source.child("strRef"), literal = source.child("numLit") ?? source.child("strLit")
+        let cache = chartCache(ref?.child("numCache") ?? ref?.child("strCache") ?? literal)
+        if let formula = ref?.child("f")?.stringValue,let values = try chartReference(formula,sheet:sheet) {
+            return values.enumerated().map { j,pair in
+                // A missing formula result can use the chart cache; an actual blank remains a gap.
+                if case .error("#UNSUPPORTED!") = pair.0,j<cache.count,let s = cache[j] { return (numeric ? Double(s).map(FValue.number) ?? .empty : .text(s),s) }
+                return pair
+            }
+        }
+        return cache.map { s in guard let s else { return (.empty,"") }; return (numeric ? Double(s).map(FValue.number) ?? .empty : .text(s),s) }
+    }
+    func readCharts(_ sheet: Int) throws -> [ChartModel] {
+        guard try sheetDocument(sheet).rootElement()?.child("drawing") != nil else { return [] }
+        var models: [ChartModel] = []; let geometry = GridGeometry(try sheetDocument(sheet).rootElement()!)
+        for (_,drawing) in try linked(sheets[sheet].path,type:"drawing") {
+            guard let root = try part(drawing).rootElement() else { continue }
+            let links = Dictionary(uniqueKeysWithValues:try linked(drawing,type:"chart"))
+            for (i,anchor) in (root.children?.compactMap { $0 as? XMLElement } ?? []).enumerated() {
+                guard let link = elements(anchor).first(where:{ $0.localName == "chart" }),let path = links[link.attr("r:id")],let chartSpace = try part(path).rootElement() else { continue }
+                let chart = chartSpace.child("chart"),plot = chart?.child("plotArea")
+                let plotTypes = plot?.children?.compactMap { $0 as? XMLElement }.filter { ($0.localName ?? "").hasSuffix("Chart") } ?? []
+                let type = plotTypes.first, rawKind = plotTypes.count == 1 ? type?.localName ?? "" : "combination"
+                var kind = rawKind
+                if rawKind == "barChart" { kind = type?.child("barDir")?.attr("val") == "bar" ? "bar" : "column" }
+                else { kind = ["lineChart":"line","pieChart":"pie","doughnutChart":"doughnut","areaChart":"area","scatterChart":"scatter"][rawKind] ?? "unsupported" }
+                let titleNode = chart?.child("title"), titleText = titleNode.map { elements($0).filter { $0.localName == "t" }.compactMap(\.stringValue).joined() } ?? ""
+                let titleValues = try chartValues(titleNode?.child("tx"),sheet:sheet,numeric:false)
+                let title = !titleText.isEmpty ? titleText : titleValues.first?.1 ?? L("Grafico","Chart")
+                var series: [ChartSeries] = []
+                for (j,ser) in (type?.kids("ser") ?? []).enumerated() {
+                    let names = try chartValues(ser.child("tx"),sheet:sheet,numeric:false)
+                    let name = ser.child("tx")?.child("v")?.stringValue ?? names.first?.1 ?? L("Serie \(j+1)","Series \(j+1)")
+                    let cat = try chartValues(ser.child("cat"),sheet:sheet,numeric:false),values = try chartValues(ser.child(kind == "scatter" ? "yVal" : "val"),sheet:sheet,numeric:true),xs = try chartValues(ser.child("xVal"),sheet:sheet,numeric:true)
+                    func number(_ pair: (FValue,String)) -> Double? { if case .number(let n) = pair.0,n.isFinite { return n }; return nil }
+                    let rgb = ser.child("spPr")?.child("solidFill")?.child("srgbClr")?.attr("val") ?? ""
+                    let color = rgb.range(of:"^[0-9a-fA-F]{6}$",options:.regularExpression) != nil ? "#"+rgb : chartPalette[j%chartPalette.count]
+                    let marker = ser.child("marker")?.child("symbol")?.attr("val")
+                    let markers = kind == "scatter" || (marker != nil ? marker != "none" : type?.child("marker")?.attr("val") == "1")
+                    series.append(ChartSeries(name:name,labels:cat.map(\.1),values:values.map(number),x:xs.map(number),color:color,markers:markers))
+                }
+                func markerPoint(_ e: XMLElement?) -> CGPoint { geometry.point(col:Int(e?.child("col")?.stringValue ?? "") ?? 0,row:Int(e?.child("row")?.stringValue ?? "") ?? 0,colOff:Double(e?.child("colOff")?.stringValue ?? "") ?? 0,rowOff:Double(e?.child("rowOff")?.stringValue ?? "") ?? 0) }
+                let from = anchor.child("from"),to = anchor.child("to")
+                let point: CGPoint
+                if from != nil { point = markerPoint(from) } else { point = CGPoint(x:40+(Double(anchor.child("pos")?.attr("x") ?? "") ?? 0)/9525,y:66+(Double(anchor.child("pos")?.attr("y") ?? "") ?? 0)/9525) }
+                let frame: CGRect
+                if let to { let end = markerPoint(to); frame = CGRect(x:point.x,y:point.y,width:max(120,end.x-point.x),height:max(100,end.y-point.y)) }
+                else { frame = CGRect(x:point.x,y:point.y,width:max(120,(Double(anchor.child("ext")?.attr("cx") ?? "") ?? 4572000)/9525),height:max(100,(Double(anchor.child("ext")?.attr("cy") ?? "") ?? 2857500)/9525)) }
+                models.append(ChartModel(id:drawing+"#\(i)",path:path,drawing:drawing,anchor:i,title:title,kind:kind,grouping:type?.child("grouping")?.attr("val") ?? "standard",series:series,frame:frame,lastRow:Int(to?.child("row")?.stringValue ?? from?.child("row")?.stringValue ?? "") ?? 15,lastCol:Int(to?.child("col")?.stringValue ?? from?.child("col")?.stringValue ?? "") ?? 8))
+            }
+        }; return models
+    }
+    func chartHTML(_ sheet: Int) throws -> String {
+        try readCharts(sheet).map { model in
+            "<div class='chart-box' tabindex='0' data-chart='\(esc(model.id))' style='left:\(chartNumber(model.frame.minX))px;top:\(chartNumber(model.frame.minY))px;width:\(chartNumber(model.frame.width))px;height:\(chartNumber(model.frame.height))px'>"+chartSVG(model)+"<div class='chart-resize' aria-label='\(esc(L("Ridimensiona grafico","Resize chart")))'></div></div>"
+        }.joined()
+    }
+    func refreshChartCaches(_ doc: XMLDocument, sheet: Int) throws {
+        guard let root = doc.rootElement() else { return }
+        for source in elements(root) where ["strRef","numRef"].contains(source.localName ?? "") {
+            guard let f = source.child("f")?.stringValue,let values = try chartReference(f,sheet:sheet) else { continue }
+            if values.contains(where:{ if case .error("#UNSUPPORTED!") = $0.0 { return true }; return false }) { continue }
+            let numeric = source.localName == "numRef",name = numeric ? "numCache" : "strCache",cache = XMLElement(name:"c:"+name),count = XMLElement(name:"c:ptCount")
+            if numeric { cache.addChild(XMLElement(name:"c:formatCode",stringValue:source.child(name)?.child("formatCode")?.stringValue ?? "General")) }
+            count.set("val",String(values.count)); cache.addChild(count)
+            for (i,pair) in values.enumerated() {
+                let text: String
+                if numeric { guard case .number(let n) = pair.0,n.isFinite else { continue }; text = FValue.number(n).text } else { text = pair.1 }
+                let point = XMLElement(name:"c:pt"); point.set("idx",String(i)); point.addChild(XMLElement(name:"c:v",stringValue:text)); cache.addChild(point)
+            }
+            // The new nodes declare their chart namespace, even when the source uses a default namespace.
+            cache.addNamespace(XMLNode.namespace(withName:"c",stringValue:chartNamespace) as! XMLNode)
+            source.child(name)?.detach(); source.addChild(cache)
+        }
+    }
+    func structuralPreflight(_ sheet: Int, _ change: GridChange) throws {
+        try editable(sheet)
+        guard change.at>0,change.count>0,change.at+change.count-1<=change.limit else { throw failure(L("Intervallo non valido.","Invalid range.")) }
+        let names = try members()
+        if names.contains(where:{ let p = $0.lowercased(); return p.contains("/pivot") || p.contains("/externallinks/") || p.contains("/querytables/") || p == "xl/connections.xml" }) {
+            throw failure(L("Inserimento/eliminazione non disponibile: il workbook contiene pivot, collegamenti esterni o connessioni dati che non posso aggiornare con sicurezza.","Cannot insert/delete: this workbook contains pivots, external links or data connections that cannot be safely updated."))
+        }
+        var owners = Set<String>()
+        for s in sheets { for kind in ["drawing","table"] { for (_,path) in try linked(s.path,type:kind) { guard owners.insert(path).inserted else { throw failure(L("Una parte disegno/tabella è condivisa da più fogli: lo spostamento non è sicuro.","A drawing/table part is shared across sheets; shifting it is unsafe.")) } } } }
+        for (i,_) in sheets.enumerated() {
+            guard let root = try sheetDocument(i).rootElement() else { continue }
+            if elements(root).contains(where:{ $0.localName == "extLst" }) || root.child("customSheetViews") != nil || i == sheet && (root.child("legacyDrawing") != nil || root.localName != "worksheet") {
+                throw failure(L("Il foglio contiene estensioni, viste personalizzate o disegni legacy che non posso spostare con sicurezza.","The sheet contains extensions, custom views or legacy drawings that cannot be safely shifted."))
+            }
+            if i == sheet, !(try linked(sheets[i].path,type:"comments")).isEmpty { throw failure(L("Sposta prima i commenti legacy in Excel.","Move legacy comments in Excel before changing the grid.")) }
+            for e in elements(root) {
+                if e.localName == "f",e.attr("t") == "dataTable" { throw failure(L("Le tabelle di simulazione richiedono Excel per modificare righe o colonne.","What-if data tables require Excel for row/column changes.")) }
+                if i == sheet,e.localName == "f",e.attr("t") == "array",let ref = GridRef(e.attr("ref")) {
+                    let a = change.rows ? ref.first.row : ref.first.col, b = change.rows ? ref.last.row : ref.last.col
+                    if let a,let b {
+                        let lo = min(a,b),hi = max(a,b)
+                        let cuts = change.deleting ? change.at<=hi && change.at+change.count-1>=lo && !(change.at<=lo && change.at+change.count-1>=hi) : change.at>lo && change.at<=hi
+                        if cuts { throw failure(L("Non posso modificare solo una parte di una formula matriciale.","Cannot change only part of an array formula.")) }
+                    }
+                }
+            }
+        }
+        for (path,doc) in documents where path == "xl/workbook.xml" || path.hasPrefix("xl/tables/") || path.hasPrefix("xl/charts/") || sheets.contains(where:{ $0.path == path }) {
+            guard let root = doc.rootElement() else { continue }
+            for e in elements(root) where ["f","formula","formula1","formula2","definedName","calculatedColumnFormula","totalsRowFormula"].contains(e.localName ?? "") {
+                let text = RefScanner.unquoted(e.stringValue ?? "")
+                if text.contains("[") || text.contains("]") || text.range(of:"[A-Za-z0-9_.']+:[A-Za-z0-9_.']+!",options:.regularExpression) != nil {
+                    throw failure(L("Il workbook usa riferimenti strutturati, esterni o 3D: aggiornarli automaticamente non è sicuro.","This workbook uses structured, external or 3D references; they cannot be safely rewritten."))
+                }
+                _ = try RefScanner.transform(text) { raw,ref in
+                    if let raw,RefScanner.sheetName(raw).contains(":") { throw failure(L("I riferimenti 3D richiedono Excel.","3D references require Excel.")) }
+                    if e.localName == "definedName",e.attr("localSheetId").isEmpty,raw == nil {
+                        throw failure(L("Un nome globale usa riferimenti relativi senza foglio: non posso determinarne l'origine.","A global defined name uses unqualified relative references; its origin cannot be determined safely."))
+                    }; return nil
+                }
+            }
+        }
+        if change.deleting && change.rows {
+            for (_,path) in try linked(sheets[sheet].path,type:"table") {
+                let root = try part(path).rootElement()
+                if let ref = root.flatMap({ GridRef($0.attr("ref")) }),let next = try ref.shifted(change) {
+                    let headers = root?.attr("headerRowCount") == "0" ? 0 : 1,totals = Int(root?.attr("totalsRowCount") ?? "") ?? 0,last = max(ref.first.row!,ref.last.row!)
+                    if max(next.first.row!,next.last.row!)-next.top+1<headers+totals+1 || totals>0 && change.at<=last && change.at+change.count>last {
+                        throw failure(L("L'eliminazione dell'ultima riga dati o dei totali di una tabella richiede Excel.","Deleting the last table data row or its totals row requires Excel."))
+                    }
+                }
+                if let ref = root.flatMap({ GridRef($0.attr("ref")) }),root?.attr("headerRowCount") != "0",change.at<=ref.top,change.at+change.count>ref.top {
+                    throw failure(L("L'eliminazione dell'intestazione di una tabella richiede Excel.","Deleting a table's header row requires Excel."))
+                }
+            }
+        }
+        if change.deleting && !change.rows {
+            for (_,path) in try linked(sheets[sheet].path,type:"table") {
+                if let root = try part(path).rootElement(),let ref = GridRef(root.attr("ref")),try ref.shifted(change) == nil {
+                    throw failure(L("Per eliminare tutte le colonne di una tabella, rimuovi prima la tabella in Excel.","To delete every column of a table, remove the table in Excel first."))
+                }
+            }
+        }
+    }
+    func shiftFilter(_ filter: XMLElement, change: GridChange) throws {
+        guard let old = GridRef(filter.attr("ref")) else { return }
+        guard let next = try old.shifted(change) else { filter.detach(); return }
+        if !change.rows {
+            for column in filter.kids("filterColumn") {
+                if let id = Int(column.attr("colId")),let shifted = change.point(old.left+id) { column.set("colId",String(shifted-next.left)) } else { column.detach() }
+            }
+        }
+        filter.set("ref",next.text)
+    }
+    func shiftScope(_ e: XMLElement, attribute: String, sheet: Int, change: GridChange) throws {
+        let scopes = e.attr(attribute).split(whereSeparator: { $0.isWhitespace }).compactMap { GridRef(String($0)) }
+        var next: [GridRef] = [], sourceAnchor: (Int,Int)?
+        for old in scopes {
+            if let mapped = try old.shifted(change) {
+                if next.isEmpty {
+                    var r = old.top,c = old.left
+                    if change.deleting { if change.rows && r>=change.at && r<change.at+change.count { r = change.at+change.count }; if !change.rows && c>=change.at && c<change.at+change.count { c = change.at+change.count } }
+                    sourceAnchor = (r,c)
+                }; next.append(mapped)
+            }
+        }
+        guard !next.isEmpty else { e.detach(); return }
+        if let original = scopes.first,let anchor = sourceAnchor {
+            for f in elements(e) where ["formula","formula1","formula2"].contains(f.localName ?? "") {
+                let rebased = fillFormula(f.stringValue ?? "",down:anchor.0-original.top,right:anchor.1-original.left)
+                f.stringValue = try rewrite(rebased,context:sheet,target:sheet,change:change)
+            }
+        }
+        e.set(attribute,next.map(\.text).joined(separator:" "))
+    }
+    func shiftGrid(_ sheet: Int, change: GridChange) throws {
+        try preparePackage(); try structuralPreflight(sheet,change)
+        let backup = try packageSnapshot()
+        do {
+            // Capture expanded shared expressions before moving cells. Preserve sharing only if
+            // the shifted expressions still form one consistent template; otherwise de-share them.
+            var formulas: [(Int,XMLElement,String,String?)] = []
+            var shared: [String:[XMLElement]] = [:], sharedRanges: [String:String] = [:]
+            for i in sheets.indices {
+                for cell in try index(i).cells.values {
+                    guard let f = cell.child("f") else { continue }
+                    let si = f.attr("t") == "shared" ? f.attr("si") : nil
+                    let text: String
+                    if si != nil { guard let expanded = formulaText(cell,sheet:i) else { throw failure(L("Formula condivisa senza origine leggibile.","Shared formula has no readable master.")) }; text = expanded }
+                    else { text = f.stringValue ?? "" }
+                    formulas.append((i,cell,text,si))
+                    if let si { let key = "\(i):\(si)"; shared[key,default:[]].append(cell); if !f.attr("ref").isEmpty { sharedRanges[key] = f.attr("ref") } }
+                }
+            }
+            let doc = try sheetDocument(sheet), root = doc.rootElement()!, data = root.child("sheetData")!
+            var inferredRow = 0
+            for row in data.kids("row") {
+                let r = Int(row.attr("r")) ?? row.kids("c").first.map { rowNumber($0.attr("r")) } ?? inferredRow+1
+                inferredRow = r
+                let nextRow = change.rows ? change.point(r) : r
+                guard let rr = nextRow else { row.detach(); continue }
+                guard rr<=1048576 else { throw failure(L("Ci sono celle all'ultima riga del foglio.","There are cells at the worksheet's last row.")) }
+                row.set("r",String(rr)); var inferred = 0
+                for c in row.kids("c") {
+                    inferred = c.attr("r").isEmpty ? inferred+1 : column(c.attr("r"))
+                    guard let cc = change.rows ? inferred : change.point(inferred) else { c.detach(); continue }
+                    guard cc<=16384 else { throw failure(L("Ci sono celle all'ultima colonna del foglio.","There are cells at the worksheet's last column.")) }
+                    c.set("r",columnName(cc)+String(rr))
+                }
+                let cols = row.kids("c").map { column($0.attr("r")) }
+                if let first = cols.min(),let last = cols.max() { row.set("spans","\(first):\(last)") } else { row.removeAttribute(forName:"spans") }
+            }
+            var desired: [ObjectIdentifier:String] = [:]
+            for (i,cell,text,si) in formulas where cell.parent?.parent != nil {
+                guard let f = cell.child("f") else { continue }
+                let shifted = try rewrite(text,context:i,target:sheet,change:change)
+                f.stringValue = shifted; desired[ObjectIdentifier(cell)] = shifted
+                if si != nil { f.removeAttribute(forName:"t"); f.removeAttribute(forName:"si"); f.removeAttribute(forName:"ref") }
+                else if i == sheet,!f.attr("ref").isEmpty,let ref = GridRef(f.attr("ref")) { if let mapped = try ref.shifted(change) { f.set("ref",mapped.text) } }
+            }
+            for (key,original) in shared {
+                let group = original.filter { desired[ObjectIdentifier($0)] != nil }.sorted { cellKey(rowNumber($0.attr("r")),column($0.attr("r")))<cellKey(rowNumber($1.attr("r")),column($1.attr("r"))) }
+                guard let master = group.first,let expression = desired[ObjectIdentifier(master)] else { continue }
+                let r = rowNumber(master.attr("r")),c = column(master.attr("r")),si = String(key.split(separator:":").last!)
+                if group.allSatisfy({ desired[ObjectIdentifier($0)] == fillFormula(expression,down:rowNumber($0.attr("r"))-r,right:column($0.attr("r"))-c) }) {
+                    for cell in group { let f = cell.child("f")!; f.set("t","shared"); f.set("si",si); if cell !== master { f.stringValue = "" } }
+                    let context = Int(key.split(separator:":")[0])!
+                    let oldRange = sharedRanges[key].flatMap(GridRef.init)
+                    let mapped = context == sheet ? try oldRange?.shifted(change) : oldRange
+                    master.child("f")!.set("ref",mapped?.text ?? master.attr("r")+":"+group.last!.attr("r"))
+                }
+            }
+            if !change.rows,let cols = root.child("cols") {
+                for col in cols.kids("col") {
+                    guard let a = Int(col.attr("min")),let b = Int(col.attr("max")),let (lo,hi) = change.interval(a,b),lo<=16384 else { col.detach(); continue }
+                    col.set("min",String(lo)); col.set("max",String(min(16384,hi)))
+                }
+            }
+            let scopedNames = ["conditionalFormatting","dataValidation","protectedRange","ignoredError"]
+            for e in elements(root) where scopedNames.contains(e.localName ?? "") && !e.attr("sqref").isEmpty { try shiftScope(e,attribute:"sqref",sheet:sheet,change:change) }
+            for e in elements(root) {
+                let name = e.localName ?? ""
+                if name == "autoFilter" { try shiftFilter(e,change:change) }
+                else if ["mergeCell","hyperlink","sortState","sortCondition"].contains(name),let ref = GridRef(e.attr("ref")) {
+                    if let next = try ref.shifted(change),name != "mergeCell" || next.first.text != next.last.text { e.set("ref",next.text) } else { e.detach() }
+                }
+                if name == "hyperlink",!e.attr("location").isEmpty { e.set("location",try rewrite(e.attr("location"),context:sheet,target:sheet,change:change)) }
+                for attr in ["activeCell","topLeftCell"] where !e.attr(attr).isEmpty {
+                    if var ref = GridRef(e.attr(attr)) { if change.rows { ref.first.row = change.point(ref.top,clamp:true); ref.last.row = ref.first.row } else { ref.first.col = change.point(ref.left,clamp:true); ref.last.col = ref.first.col }; e.set(attr,ref.text) }
+                }
+                if name == "selection",let ref = GridRef(e.attr("sqref")) { e.set("sqref",try ref.shifted(change)?.text ?? e.attr("activeCell")) }
+                if name == "pane" {
+                    let key = change.rows ? "ySplit" : "xSplit"
+                    if let n = Int(e.attr(key)),e.attr("state").hasPrefix("frozen") { let split = max(0,(change.point(n+1,clamp:true) ?? 1)-1); e.set(key,String(split)); if (Int(e.attr("xSplit")) ?? 0) == 0 && (Int(e.attr("ySplit")) ?? 0) == 0 { e.detach() } }
+                }
+            }
+            for parent in root.kids("mergeCells") { parent.set("count",String(parent.kids("mergeCell").count)); if parent.kids("mergeCell").isEmpty { parent.detach() } }
+            for parent in root.kids("dataValidations") { parent.set("count",String(parent.kids("dataValidation").count)); if parent.kids("dataValidation").isEmpty { parent.detach() } }
+            for kind in ["rowBreaks","colBreaks"] {
+                if let breaks = root.child(kind) {
+                    for brk in breaks.kids("brk") where (kind == "rowBreaks") == change.rows {
+                        if let n = Int(brk.attr("id")),let next = change.point(n) { brk.set("id",String(next)) } else { brk.detach() }
+                    }; breaks.set("count",String(breaks.kids("brk").count)); breaks.set("manualBreakCount",String(breaks.kids("brk").count))
+                }
+            }
+            for name in try part("xl/workbook.xml").nodes("/workbook/definedNames/definedName") {
+                name.stringValue = try rewrite(name.stringValue ?? "",context:Int(name.attr("localSheetId")),target:sheet,change:change)
+            }
+            var rewrittenCharts = Set<String>()
+            for i in sheets.indices {
+                if i != sheet,let other = try sheetDocument(i).rootElement() { for f in elements(other) where ["formula","formula1","formula2"].contains(f.localName ?? "") { f.stringValue = try rewrite(f.stringValue ?? "",context:i,target:sheet,change:change) } }
+                if i != sheet,let other = try sheetDocument(i).rootElement() {
+                    for link in other.child("hyperlinks")?.kids("hyperlink") ?? [] where !link.attr("location").isEmpty { link.set("location",try rewrite(link.attr("location"),context:i,target:sheet,change:change)) }
+                }
+                if try members().contains(relationshipsPart(sheets[i].path)),let rels = try part(relationshipsPart(sheets[i].path)).rootElement() {
+                    for link in rels.kids("Relationship") where link.attr("Type").hasSuffix("/hyperlink") && link.attr("Target").hasPrefix("#") {
+                        link.set("Target","#"+(try rewrite(String(link.attr("Target").dropFirst()),context:i,target:sheet,change:change)))
+                    }
+                }
+                for (_,path) in try linked(sheets[i].path,type:"table") {
+                    guard let table = try part(path).rootElement(),let ref = GridRef(table.attr("ref")) else { continue }
+                    if i == sheet {
+                        if let next = try ref.shifted(change) { table.set("ref",next.text) }
+                        if let filter = table.child("autoFilter") { try shiftFilter(filter,change:change) }
+                        for e in elements(table) where ["sortState","sortCondition"].contains(e.localName ?? "") { if let ref = GridRef(e.attr("ref")) { if let next = try ref.shifted(change) { e.set("ref",next.text) } else { e.detach() } } }
+                        if !change.rows,let columns = table.child("tableColumns") {
+                            let old = columns.kids("tableColumn")
+                            if change.deleting { for (j,col) in old.enumerated() where change.point(ref.left+j) == nil { col.detach() } }
+                            else if change.at>ref.left && change.at<=max(ref.first.col!,ref.last.col!) {
+                                var id = (old.compactMap { Int($0.attr("id")) }.max() ?? 0)+1
+                                let names = Set(old.map { $0.attr("name") }); var added: [CellEdit] = []
+                                for j in 0..<change.count {
+                                    var title = L("Colonna\(id)","Column\(id)"); while names.contains(title) { id += 1; title = L("Colonna\(id)","Column\(id)") }
+                                    let col = partElement("tableColumn",like:columns); col.set("id",String(id)); col.set("name",title); columns.insertChild(col,at:change.at-ref.left+j); id += 1
+                                    if table.attr("headerRowCount") != "0" { added.append(CellEdit(ref:columnName(change.at+j)+String(ref.top),value:title,kind:.text)) }
+                                }
+                                invalidate(); if !added.isEmpty { try applyEdits(sheet,added) }
+                            }
+                            columns.set("count",String(columns.kids("tableColumn").count))
+                        }
+                    }
+                    for formula in elements(table) where ["calculatedColumnFormula","totalsRowFormula"].contains(formula.localName ?? "") { formula.stringValue = try rewrite(formula.stringValue ?? "",context:i,target:sheet,change:change) }
+                }
+                for (_,drawing) in try linked(sheets[i].path,type:"drawing") {
+                    if i == sheet,let dr = try part(drawing).rootElement() {
+                        for anchor in dr.children?.compactMap({ $0 as? XMLElement }) ?? [] {
+                            let key = change.rows ? "row" : "col"
+                            if anchor.attr("editAs") == "absolute" { continue }
+                            let from = anchor.child("from")?.child(key),to = anchor.child("to")?.child(key)
+                            let before = Int(from?.stringValue ?? "") ?? 0
+                            if let from { from.stringValue = String(max(0,(change.point(before+1,clamp:true) ?? 1)-1)) }
+                            if let to,let n = Int(to.stringValue ?? "") {
+                                let moved = anchor.attr("editAs") == "oneCell" ? n+(Int(from?.stringValue ?? "") ?? before)-before : max(0,(change.point(n+1,clamp:true) ?? 1)-1)
+                                to.stringValue = String(max(Int(from?.stringValue ?? "") ?? 0,moved))
+                            }
+                        }
+                    }
+                    for (_,chart) in try linked(drawing,type:"chart") where rewrittenCharts.insert(chart).inserted {
+                        if let cr = try part(chart).rootElement() { for f in elements(cr) where f.localName == "f" { f.stringValue = try rewrite(f.stringValue ?? "",context:i,target:sheet,change:change) } }
+                    }
+                }
+            }
+            for (path,doc) in documents where path.hasPrefix("xl/charts/") && !rewrittenCharts.contains(path) { if let cr = doc.rootElement() { for f in elements(cr) where f.localName == "f" { f.stringValue = try rewrite(f.stringValue ?? "",context:nil,target:sheet,change:change) } } }
+            root.child("dimension")?.detach()
+            let cells = data.kids("row").flatMap { $0.kids("c") }
+            let dim = partElement("dimension",like:root)
+            if !cells.isEmpty { let rows = cells.map { rowNumber($0.attr("r")) },cols = cells.map { column($0.attr("r")) }; dim.set("ref",columnName(cols.min()!)+String(rows.min()!)+":"+columnName(cols.max()!)+String(rows.max()!)) } else { dim.set("ref","A1") }
+            let at = (root.children ?? []).firstIndex { !["sheetPr"].contains($0.localName ?? "") && $0 is XMLElement } ?? 0; root.insertChild(dim,at:at)
+            dirty = true; invalidate()
+        } catch { try restorePackage(backup); throw error }
+    }
     func sort(_ sheet: Int, column col: Int, row selectedRow: Int, ascending: Bool) throws {
         let doc = try sheetDocument(sheet), idx = try index(sheet)
         guard doc.rootElement()?.child("sheetProtection") == nil else { throw failure(L("Il foglio è protetto.", "The sheet is protected.")) }
@@ -605,6 +1357,8 @@ final class Book {
     }
     func save(to destination: URL) throws {
         if !dirty { if destination.standardizedFileURL != url.standardizedFileURL { try Data(contentsOf: url).write(to: destination, options: .atomic) }; return }
+        var chartOwners: [String:Int] = [:]
+        for i in sheets.indices where try sheetDocument(i).rootElement()?.child("drawing") != nil { for (_,drawing) in try linked(sheets[i].path,type:"drawing") { for (_,chart) in try linked(drawing,type:"chart") { chartOwners[chart] = i; _ = try part(chart) } } }
         let fm = FileManager.default, temp = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try fm.createDirectory(at: temp, withIntermediateDirectories: true); defer { try? fm.removeItem(at: temp) }
         let archive = temp.appendingPathComponent("edited.xlsx"), staging = temp.appendingPathComponent("contents")
@@ -618,23 +1372,26 @@ final class Book {
         for i in sheets.indices where documents[sheets[i].path] != nil {
             let doc = try XMLDocument(data: sheetDocument(i).xmlData, options: [.nodePreserveWhitespace])
             // Discard stale formula caches: Excel recomputes them when the file is opened.
-            for cell in doc.nodes("/worksheet/sheetData/row/c[f]") { if let c = cell as? XMLElement, (try? computed(c,sheet:i)) != nil { for v in c.nodes("v") { v.detach() } } }
+            for c in doc.rootElement()?.child("sheetData")?.kids("row").flatMap({ $0.kids("c") }) ?? [] where c.child("f") != nil { if (try? computed(c,sheet:i)) != nil { c.kids("v").forEach { $0.detach() } } }
             try write(sheets[i].path, doc)
         }
-        if let styles = documents["xl/styles.xml"] { try write("xl/styles.xml",styles) }
-        let workbook = try xml("xl/workbook.xml")
+        for (path,document) in documents where !sheets.contains(where:{ $0.path == path }) && !["xl/workbook.xml","xl/_rels/workbook.xml.rels","[Content_Types].xml"].contains(path) && !removedMembers.contains(path) {
+            if document.rootElement()?.localName == "chartSpace" { let copy = try XMLDocument(data:document.xmlData,options:[.nodePreserveWhitespace]); try refreshChartCaches(copy,sheet:chartOwners[path] ?? 0); try write(path,copy) }
+            else { try write(path,document) }
+        }
+        let workbook = try XMLDocument(data:part("xl/workbook.xml").xmlData,options:[.nodePreserveWhitespace])
         let calc = (workbook.nodes("/workbook/calcPr").first as? XMLElement) ?? XMLElement(name: "calcPr")
         if calc.parent == nil { workbook.rootElement()?.addChild(calc) }
         for (key, value) in [("calcMode", "auto"), ("fullCalcOnLoad", "1"), ("forceFullCalc", "1")] { calc.removeAttribute(forName: key); calc.addAttribute(XMLNode.attribute(withName: key, stringValue: value) as! XMLNode) }
         try write("xl/workbook.xml", workbook)
-        let rels = try xml("xl/_rels/workbook.xml.rels")
+        let rels = try XMLDocument(data:part("xl/_rels/workbook.xml.rels").xmlData,options:[.nodePreserveWhitespace])
         for r in rels.nodes("/Relationships/Relationship") where r.attr("Type").hasSuffix("/calcChain") { r.detach() }
         if documents["xl/styles.xml"] != nil, !rels.nodes("/Relationships/Relationship").contains(where:{ $0.attr("Type").hasSuffix("/styles") }) {
             let node = XMLElement(name:"Relationship"), used = Set(rels.nodes("/Relationships/Relationship").map { $0.attr("Id") }); var n = 1; while used.contains("rId\(n)") { n += 1 }
             node.set("Id","rId\(n)"); node.set("Type","http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles"); node.set("Target","styles.xml"); rels.rootElement()?.addChild(node)
         }
         try write("xl/_rels/workbook.xml.rels", rels)
-        let types = try xml("[Content_Types].xml")
+        let types = try XMLDocument(data:part("[Content_Types].xml").xmlData,options:[.nodePreserveWhitespace])
         for t in types.nodes("/Types/Override") where t.attr("PartName") == "/xl/calcChain.xml" { t.detach() }
         if documents["xl/styles.xml"] != nil, !types.nodes("/Types/Override").contains(where:{ $0.attr("PartName") == "/xl/styles.xml" }) {
             let node = XMLElement(name:"Override"); node.set("PartName","/xl/styles.xml"); node.set("ContentType","application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"); types.rootElement()?.addChild(node)
@@ -645,7 +1402,7 @@ final class Book {
             try process.run(); process.waitUntilExit()
             if process.terminationStatus != 0 && !(acceptMissing && process.terminationStatus == 12) { throw failure(L("Impossibile creare il file. L'originale non è stato modificato.", "Could not write the file. The original was not changed."), 4) }
         }
-        try zip(["-q", "-d", archive.path, "xl/calcChain.xml"], acceptMissing: true)
+        try zip(["-q", "-d", archive.path, "xl/calcChain.xml"]+removedMembers.sorted(), acceptMissing: true)
         try zip(["-q", archive.path] + members)
         _ = try Book(archive)
         try Data(contentsOf: archive).write(to: destination, options: .atomic)
@@ -657,6 +1414,7 @@ final class Book {
         memo.removeAll(); calculationTime = Date()
         let sheetIndex = try self.index(index)
         let grid = sheetIndex.cells, hiddenRows = sheetIndex.hiddenRows
+        let geometry = GridGeometry(root)
         var maxRow = sheetIndex.maxRow, maxCol = sheetIndex.maxCol
         maxCol = min(max(maxCol, maxRow <= 1000 ? 26 : 1), 1000); maxRow = max(maxRow, 100)
         var widths = [Int: Double](); var hiddenCols = Set<Int>()
@@ -664,7 +1422,7 @@ final class Book {
             let lo = Int(c.attr("min")) ?? 1, hi = min(maxCol, Int(c.attr("max")) ?? 1)
             guard lo <= hi else { continue }
             for i in lo...hi {
-                widths[i] = min(620, max(48, (Double(c.attr("width")) ?? 12) * 7 + 8))
+                widths[i] = geometry.width(i)
                 if ["1", "true"].contains(c.attr("hidden")) { hiddenCols.insert(i) }
             }
         }
@@ -692,7 +1450,12 @@ final class Book {
         let filterStart = filterParts.first ?? "", filterEnd = filterParts.last ?? ""
         let filterRow = rowNumber(filterStart), filterLastRow = min(lastRow, max(rowNumber(filterEnd), filterRow))
         let marginTop = 70 + frozenRows * 27, marginLeft = Int(offsets[columns.first { $0 > frozenCols } ?? 1] ?? 40) + 4
-        let strings = ["search": L("Cerca valore…", "Search values…"), "all": L("Tutti i valori", "All values"), "empty": L("(Vuote)", "(Blanks)"), "more": L("Altri valori: usa la ricerca", "More values: use search"), "asc": L("Ordina A → Z","Sort A → Z"), "desc": L("Ordina Z → A","Sort Z → A"), "sum": L("Somma","Sum"), "average": L("Media","Average"), "count": L("Conteggio","Count"), "edit": L("Modifica cella","Edit cell")]
+        var strings = ["search": L("Cerca valore…", "Search values…"), "all": L("Tutti i valori", "All values"), "empty": L("(Vuote)", "(Blanks)"), "more": L("Altri valori: usa la ricerca", "More values: use search"), "asc": L("Ordina A → Z","Sort A → Z"), "desc": L("Ordina Z → A","Sort Z → A"), "sum": L("Somma","Sum"), "average": L("Media","Average"), "count": L("Conteggio","Count"), "edit": L("Modifica cella","Edit cell")]
+        for rows in [true,false] { for after in [false,true] {
+            strings[(rows ? "row" : "col")+(after ? "After" : "Before")] = gridActionTitle(rows:rows,count:0,deleting:false,after:after)
+        }; strings[rows ? "rowDelete" : "colDelete"] = gridActionTitle(rows:rows,count:0,deleting:true)
+            for position in ["Before","After","Delete"] { strings[(rows ? "row" : "col")+position+"One"] = gridActionTitle(rows:rows,count:1,deleting:position == "Delete",after:position == "After") }
+        }
         let stringsJSON = String(data: try JSONSerialization.data(withJSONObject: strings), encoding: .utf8)!
 
         let styleRules = styles.enumerated().filter { !$0.element.css.isEmpty }.map { "td.s\($0.offset){\($0.element.css)}" }.joined()
@@ -711,18 +1474,20 @@ final class Book {
         #filter-menu{position:fixed;z-index:100;background:#fff;color:#222;border:1px solid #ddd;border-radius:9px;box-shadow:0 5px 25px #0003;width:230px;padding:6px;max-height:350px;overflow:auto;font:13px -apple-system,system-ui}
         #filter-menu button{display:block;border:0;background:transparent;border-radius:4px;text-align:left;width:100%;padding:7px;color:#222;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}#filter-menu button:hover{background:#e6efff}
         #filter-menu input{width:100%;padding:7px;border:1px solid #ddd;border-radius:4px;margin-bottom:4px}#filter-menu .more{padding:7px;color:#888;font-size:12px}
-        body{padding-bottom:24px}#formula-bar{position:sticky;top:0;left:0;z-index:30;height:42px;background:#f8f9fa;display:flex;align-items:center;gap:8px;padding:5px;width:100vw;border-bottom:1px solid #ddd}#name{width:110px}#formula{flex:1;min-width:80px;height:29px;resize:none;white-space:pre}#formula-bar :is(input,textarea){font:13px -apple-system;padding:5px;border:1px solid #ddd;border-radius:3px}#message{color:#b3261e;font-size:12px;max-width:35vw}#editor{resize:none;position:absolute;z-index:40;border:2px solid #2979e8;background:white;color:#202124;font:13px -apple-system;padding:0 6px;outline:none}#selection-border{position:absolute;pointer-events:none;z-index:12;border:2px solid #1a73e8}#fill-handle{position:absolute;width:8px;height:8px;right:-5px;bottom:-5px;border:1px solid white;background:#1a73e8;cursor:crosshair;pointer-events:auto}th.selected-header{background:#d3e3fd!important;color:#174ea6;font-weight:700}body.paint td{cursor:crosshair}#stats{position:fixed;bottom:0;right:0;z-index:35;background:#f8f9fa;padding:4px 12px;font-size:12px}table{user-select:none}#formula-bar :is(input,textarea){user-select:text}
-        @media print{#formula-bar,#stats,#editor,#message,#selection-border{display:none!important}thead th,tbody th,td{position:static!important}td.sel{outline:none;box-shadow:none!important}th.selected-header{background:#f3f4f6!important}tr:hover td{box-shadow:none}td.fh::after{content:''}}
+        body{padding-bottom:24px}#formula-bar{position:sticky;top:0;left:0;z-index:30;height:42px;background:#f8f9fa;display:flex;align-items:center;gap:8px;padding:5px;width:100vw;border-bottom:1px solid #ddd}#name{width:110px}#formula{flex:1;min-width:80px;height:29px;resize:none;white-space:pre}#formula-bar :is(input,textarea){font:13px -apple-system;padding:5px;border:1px solid #ddd;border-radius:3px}#message{color:#b3261e;font-size:12px;max-width:35vw}#editor{resize:none;position:absolute;z-index:40;border:2px solid #2979e8;background:white;color:#202124;font:13px -apple-system;padding:0 6px;outline:none}#selection-border{position:absolute;pointer-events:none;z-index:12;border:2px solid #1a73e8}#fill-handle{position:absolute;width:8px;height:8px;right:-5px;bottom:-5px;border:1px solid white;background:#1a73e8;cursor:crosshair;pointer-events:auto}tr[style]>td,tr[style]>th{height:inherit}th.selected-header{background:#d3e3fd!important;color:#174ea6;font-weight:700}body.paint td{cursor:crosshair}#stats{position:fixed;bottom:0;right:0;z-index:35;background:#f8f9fa;padding:4px 12px;font-size:12px}table{user-select:none}#formula-bar :is(input,textarea){user-select:text}
+        .chart-box{position:absolute;z-index:15;background:white;box-shadow:0 1px 5px #0003;user-select:none;touch-action:none}.chart-box.selected-chart{outline:2px solid #1a73e8}.chart-box svg{display:block;pointer-events:none}.chart-resize{display:none;position:absolute;width:12px;height:12px;right:-6px;bottom:-6px;background:#1a73e8;border:2px solid white;cursor:nwse-resize}.selected-chart .chart-resize{display:block}#grid-menu{position:fixed;z-index:100;background:white;border:1px solid #ddd;border-radius:6px;padding:5px;box-shadow:0 4px 18px #0003}#grid-menu button{display:block;width:100%;border:0;background:white;padding:8px;text-align:left;font:13px -apple-system}#grid-menu button:hover{background:#e6efff}
+        @media print{.chart-resize,#grid-menu{display:none!important}.chart-box{box-shadow:none;outline:none!important}#formula-bar,#stats,#editor,#message,#selection-border{display:none!important}thead th,tbody th,td{position:static!important}td.sel{outline:none;box-shadow:none!important}th.selected-header{background:#f3f4f6!important}tr:hover td{box-shadow:none}td.fh::after{content:''}}
         </style></head><body><div id="formula-bar"><input id="name" aria-label="\(L("Cella o intervallo","Cell or range"))" placeholder="A1"><span style="font:italic 16px Georgia;color:#747775">fx</span><textarea id="formula" rows="1" wrap="off" aria-label="\(L("Barra della formula","Formula bar"))"></textarea><span id="message" role="alert"></span></div><div id="stats"></div><table><colgroup><col style="width:40px">
         """
         html.reserveCapacity(rows.count * columns.count * 48 + 4096)
-        for c in columns { html += "<col data-c='\(c)' style='width:\(Int(widths[c] ?? 110))px'>" }
+        for c in columns { html += "<col data-c='\(c)' style='width:\(chartNumber(widths[c] ?? 110))px'>" }
         html += "</colgroup><thead><tr><th style='left:0;z-index:9'></th>"
         for c in columns { html += "<th data-c='\(c)'\(c <= frozenCols ? " style='left:\(Int(offsets[c] ?? 40))px;z-index:8'" : "")>\(columnName(c))</th>" }
         html += "</tr></thead><tbody>"
-        for (i, r) in rows.enumerated() {
-            let isFrozen = r <= frozenRows, top = 66 + i * 27
-            html += "<tr data-row='\(r)'\(r == frozenRows && frozenRows > 0 ? " class='heading'" : "")><th\(isFrozen ? " style='top:\(top)px;z-index:8'" : "")>\(r)</th>"
+        for r in rows {
+            let isFrozen = r <= frozenRows, top = r <= frozenRows ? Int(geometry.point(col:0,row:r-1).y) : 0
+            let rowHeight = geometry.heights[r].map { " style='height:\(chartNumber($0))px'" } ?? ""
+            html += "<tr\(rowHeight) data-row='\(r)'\(r == frozenRows && frozenRows > 0 ? " class='heading'" : "")><th\(isFrozen ? " style='top:\(top)px;z-index:8'" : "")>\(r)</th>"
             for c in columns {
                 let key = cellKey(r, c); if covered.contains(key) { if !firstNumber { numericJS += "," }; firstNumber = false; numericJS += "null"; continue }
                 let cell = grid[key] ?? sheetIndex.blankCells[key]
@@ -756,13 +1521,13 @@ final class Book {
         numericJS += "]"
         let formulaJSON = String(data:try JSONSerialization.data(withJSONObject:formulaRaw),encoding:.utf8)!.replacingOccurrences(of:"<",with:"\\u003c")
         html += """
-        </tbody></table><script>
+        </tbody></table><div id="charts">\(try chartHTML(index))</div><script>
         const T=\(stringsJSON);let FR=\(filterRow),FL=\(filterLastRow),filterC1=\(column(filterStart)),filterC2=\(column(filterEnd));let filters={},current=null,anchor=null,selected=new Set(),dragging=false,editing=null,pendingMove=null,busy=false;
         const HR=new Set(\(hiddenRows.sorted())),HC=new Set(\(hiddenCols.sorted()));
         const full=td=>td.dataset.full??td.textContent;
         function colName(c){let s='';while(c>0){c--;s=String.fromCharCode(65+c%26)+s;c=Math.floor(c/26)}return s}
         const refOf=td=>colName(+td.dataset.c)+td.parentElement.dataset.row;
-        const mutationActions=new Set(['commit','clear','cut','paste','fillDown','autofill','undo','redo','sort']);
+        const mutationActions=new Set(['commit','clear','cut','paste','fillDown','autofill','undo','redo','sort','gridChange','chartFrame','chartDelete']);
         const post=m=>{if(mutationActions.has(m.action)){if(busy)return;busy=true}window.webkit?.messageHandlers.cell.postMessage(m)};
         const rows=[...document.querySelectorAll('tbody tr')],rowMap=new Map(rows.map(r=>[+r.dataset.row,r]));
         const cellAt=(tr,c)=>tr?.querySelector(`td[data-c="${c}"]`);
@@ -780,13 +1545,13 @@ final class Book {
         function bounds(){const a=anchor??current,b=current;return {r1:Math.min(+a.parentElement.dataset.row,+b.parentElement.dataset.row),r2:Math.max(+a.parentElement.dataset.row,+b.parentElement.dataset.row),c1:Math.min(+a.dataset.c,+b.dataset.c),c2:Math.max(+a.dataset.c,+b.dataset.c)}}
         function updateStats(){let sum=0,count=0;for(const td of selected){if(numbers.has(keyOf(td))){sum+=numbers.get(keyOf(td));count++}}stats.dataset.sum=sum;stats.dataset.average=count?sum/count:0;stats.dataset.count=count;const fmt=n=>n.toLocaleString(undefined,{maximumFractionDigits:10});stats.textContent=selected.size<2?'':`${T.sum}: ${fmt(sum)}   ${T.average}: ${count?fmt(sum/count):'—'}   ${T.count}: ${fmt(count)}`}
         const selectionBorder=document.createElement('div');selectionBorder.id='selection-border';const handle=document.createElement('div');handle.id='fill-handle';selectionBorder.append(handle);document.body.append(selectionBorder);
-        let selectedHeaders=[],filling=null,fillTarget=null,paintArmed=false,pendingFill=null;
+        let headerDrag=null;let selectedHeaders=[],filling=null,fillTarget=null,paintArmed=false,pendingFill=null;
         function selectionFurniture(){if(!current)return;for(const th of selectedHeaders)th.classList.remove('selected-header');selectedHeaders=[];const b=bounds();for(const th of document.querySelectorAll('thead th[data-c]'))if(+th.dataset.c>=b.c1&&+th.dataset.c<=b.c2)selectedHeaders.push(th);for(let r=b.r1;r<=b.r2;r++){const th=rowMap.get(r)?.querySelector('th');if(th)selectedHeaders.push(th)}for(const th of selectedHeaders)th.classList.add('selected-header');const a=at(b.r1,b.c1),z=at(b.r2,b.c2);if(!a||!z){selectionBorder.hidden=true;return}const x=a.getBoundingClientRect(),y=z.getBoundingClientRect();selectionBorder.hidden=false;Object.assign(selectionBorder.style,{left:x.left+scrollX+'px',top:x.top+scrollY+'px',width:y.right-x.left+'px',height:y.bottom-x.top+'px'})}
         window.armPaint=on=>{paintArmed=on;document.body.classList.toggle('paint',on)};
         function finishPaint(){if(!paintArmed)return;paintArmed=false;document.body.classList.remove('paint');post({action:'paint'})}
         handle.addEventListener('mousedown',e=>{if(busy)return;e.preventDefault();e.stopPropagation();filling=bounds();fillTarget=filling});
         function notifySelection(){selectionFurniture();const b=bounds();post({action:'select',ref:refOf(current),text:full(current),...Object.fromEntries(Object.entries(b).map(([k,v])=>[k,String(v)]))});nameBox.value=selected.size>1?colName(b.c1)+b.r1+':'+colName(b.c2)+b.r2:refOf(current);bar.value=raw(current);updateStats()}
-        function select(td,scroll=false,extend=false){if(!td)return;if(editing)cancelEdit();if(!extend||!anchor)anchor=td;current?.classList.remove('active');current=td;current.classList.add('active');const b=bounds(),next=new Set();for(let r=b.r1;r<=b.r2;r++){const row=rowMap.get(r);if(!row||row.hidden)continue;for(let c=b.c1;c<=b.c2;c++){const x=cellAt(row,c);if(x)next.add(x)}}for(const x of selected)if(!next.has(x))x.classList.remove('sel');for(const x of next)if(!selected.has(x))x.classList.add('sel');selected=next;const s=getSelection(),range=document.createRange();range.selectNodeContents(td);s.removeAllRanges();s.addRange(range);if(scroll)td.scrollIntoView({block:'nearest',inline:'nearest'});notifySelection()}
+        function select(td,scroll=false,extend=false){if(!td)return;deselectChart();if(editing)cancelEdit();if(!extend||!anchor)anchor=td;current?.classList.remove('active');current=td;current.classList.add('active');const b=bounds(),next=new Set();for(let r=b.r1;r<=b.r2;r++){const row=rowMap.get(r);if(!row||row.hidden)continue;for(let c=b.c1;c<=b.c2;c++){const x=cellAt(row,c);if(x)next.add(x)}}for(const x of selected)if(!next.has(x))x.classList.remove('sel');for(const x of next)if(!selected.has(x))x.classList.add('sel');selected=next;const s=getSelection(),range=document.createRange();range.selectNodeContents(td);s.removeAllRanges();s.addRange(range);if(scroll)td.scrollIntoView({block:'nearest',inline:'nearest'});notifySelection()}
         function ensure(r,c){let width=Math.max(...[...document.querySelectorAll('thead th')].map(th=>+th.dataset.c||0));const table=document.querySelector('table');while(width<c){width++;const col=document.createElement('col');col.style.width='110px';col.dataset.c=width;document.querySelector('colgroup').append(col);const th=document.createElement('th');th.textContent=colName(width);th.dataset.c=width;document.querySelector('thead tr').append(th);for(const row of rows){const td=document.createElement('td');td.dataset.c=width;row.append(td)}}table.style.width=[...document.querySelectorAll('colgroup col')].reduce((n,x)=>n+parseFloat(x.style.width),0)+'px';let last=+(rows.at(-1)?.dataset.row??0);while(last<r){last++;const row=document.createElement('tr');row.dataset.row=last;const th=document.createElement('th');th.textContent=last;row.append(th);for(let cc=1;cc<=width;cc++){const td=document.createElement('td');td.dataset.c=cc;row.append(td)}document.querySelector('tbody').append(row);rows.push(row);rowMap.set(last,row)}return at(r,c)}
         window.setCells=list=>{for(const [r,c,value,pick,rawValue,n,css] of list){if(HR.has(r)||HC.has(c))continue;let td=at(r,c);if(!td&&rowMap.has(r)&&c<=Math.max(...[...document.querySelectorAll('thead th')].map(th=>+th.dataset.c||0)))continue;if(!td&&!pick)continue;if(!td)td=ensure(r,c);if(!td)continue;td.textContent=value.replaceAll('\\n',' ');if(value.includes('\\n'))td.dataset.full=value;else delete td.dataset.full;raws.set(keyOf(td),rawValue??value);if(n!==null&&n!==undefined)numbers.set(keyOf(td),n);else numbers.delete(keyOf(td));td.toggleAttribute('n',n!==null&&n!==undefined);if(css!==undefined){for(const cls of [...td.classList])if(/^s[0-9]+$/.test(cls))td.classList.remove(cls);for(const key of ['font-weight','font-style','text-decoration','font-size','color','background','text-align','white-space','overflow-wrap'])td.style.removeProperty(key);const temp=document.createElement('span');temp.style.cssText=css;for(const key of Array.from(temp.style))td.style.setProperty(key,temp.style.getPropertyValue(key))};td.title=value.length>28?value:''}if(Object.keys(filters).length)applyFilters();if(current){bar.value=raw(current);updateStats();selectionFurniture()}};
         function showFilter(td){closeFilter();const c=td.dataset.c,seen=new Set();dataRows().forEach(row=>{const x=cellAt(row,c);seen.add(x?full(x):'')});const values=[...seen].sort((a,b)=>a.localeCompare(b,undefined,{numeric:true})),menu=document.createElement('div');menu.id='filter-menu';const input=document.createElement('input');input.placeholder=T.search;const list=document.createElement('div');menu.append(input,list);const add=(label,on,fn)=>{const b=document.createElement('button');b.textContent=(on?'✓ ':'')+label;b.title=label;b.onclick=fn;list.append(b)};const draw=()=>{list.textContent='';add(T.asc,false,()=>{post({action:'sort',ascending:'1',col:c});closeFilter()});add(T.desc,false,()=>{post({action:'sort',ascending:'0',col:c});closeFilter()});const q=input.value.toLowerCase();if(!q)add(T.all,filters[c]===undefined,()=>{delete filters[c];applyFilters()});let n=0;for(const v of values){if(q&&!v.toLowerCase().includes(q))continue;if(n++>=300){const more=document.createElement('div');more.className='more';more.textContent=T.more;list.append(more);break}add(v||T.empty,filters[c]===v,()=>{filters[c]=v;applyFilters()})}};input.oninput=draw;draw();document.body.append(menu);const box=td.getBoundingClientRect();menu.style.left=Math.max(6,Math.min(box.left,innerWidth-236))+'px';menu.style.top=Math.max(6,Math.min(box.bottom+3,innerHeight-356))+'px';input.focus()}
@@ -797,8 +1562,8 @@ final class Book {
         window.editResult=(ok,message)=>{busy=false;document.getElementById('message').textContent=message??'';if(!ok){pendingMove=null;pendingFill=null;editing?.focus();selectionFurniture();return}cancelEdit();if(pendingFill){const fill=pendingFill;pendingFill=null;select(at(fill.r1,fill.c1));select(at(fill.r2,fill.c2),false,true)}else if(current&&pendingMove){const next=neighbor(current,...pendingMove);if(next)select(next,true)}else if(current)notifySelection();pendingMove=null};
         bar.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();commit(bar.value,null)}if(e.key==='Escape'){e.preventDefault();cancelEdit()}});
         nameBox.addEventListener('keydown',e=>{if(e.key!=='Enter')return;const parts=nameBox.value.toUpperCase().split(':'),parse=s=>{const m=/^([A-Z]{1,3})([1-9][0-9]*)$/.exec(s);if(!m)return null;let c=0;for(const ch of m[1])c=c*26+ch.charCodeAt(0)-64;return [+m[2],c]};const a=parse(parts[0]),b=parse(parts[1]??parts[0]);if(a&&b&&Math.max(a[0],b[0])<=1048576&&Math.max(a[1],b[1])<=1000&&Math.max(a[0],b[0])*Math.max(a[1],b[1])<=400000){select(ensure(...a));select(ensure(...b),true,true);nameBox.blur()}});
-        document.addEventListener('mousedown',e=>{if(e.button!==0||e.target.closest('input,textarea,#filter-menu'))return;const td=e.target.closest('td');if(td){e.preventDefault();if(editing){commit(editing.value,null);return}select(td,false,e.shiftKey);dragging=true}else if(e.target.tagName==='TH'){e.preventDefault();const th=e.target;if(th.closest('thead')&&th.dataset.c){const c=+th.dataset.c;select(at(+rows[0].dataset.row,c));select(at(+rows.at(-1).dataset.row,c),false,true)}else if(th.parentElement.dataset.row){const row=th.parentElement;select(row.querySelector('td'));select(row.querySelector('td:last-child'),false,true)}}});
-        document.addEventListener('mouseover',e=>{if(filling){const td=e.target.closest?.('td');if(td){const r=+td.parentElement.dataset.row,c=+td.dataset.c;fillTarget=r>filling.r2&&r-filling.r2>=c-filling.c2?{...filling,r2:r}:{...filling,c2:Math.max(c,filling.c2)};const z=at(fillTarget.r2,fillTarget.c2);if(z){const a=at(filling.r1,filling.c1).getBoundingClientRect(),b=z.getBoundingClientRect();selectionBorder.style.width=b.right-a.left+'px';selectionBorder.style.height=b.bottom-a.top+'px'}}return}const tip=e.target.closest?.('td');if(tip&&!tip.title&&full(tip).length>28)tip.title=full(tip);if(dragging){const td=e.target.closest('td');if(td&&td!==current)select(td,false,true)}});document.addEventListener('mouseup',()=>{dragging=false;if(filling){const source=filling,target=fillTarget;filling=null;fillTarget=null;pendingFill=target;post({action:'autofill',source:JSON.stringify(source),target:JSON.stringify(target)});return}finishPaint()});document.addEventListener('keyup',e=>{if(e.key.startsWith('Arrow')||e.key==='Tab')finishPaint()});
+        document.addEventListener('mousedown',e=>{if(e.button!==0||e.target.closest('input,textarea,#filter-menu,#grid-menu,.chart-box'))return;const td=e.target.closest('td');if(td){e.preventDefault();if(editing){commit(editing.value,null);return}select(td,false,e.shiftKey);dragging=true}else if(e.target.tagName==='TH'){e.preventDefault();const th=e.target;headerDrag=headerInfo(th);if(headerDrag){if(e.shiftKey&&current){const b=bounds();headerDrag.start=headerDrag.rows?b.r1:b.c1}else headerDrag.start=headerDrag.n;selectHeaders(headerDrag,headerDrag.n)}}});
+        document.addEventListener('mouseover',e=>{if(headerDrag){const h=headerInfo(e.target.closest?.('th'));if(h&&h.rows===headerDrag.rows)selectHeaders(headerDrag,h.n);return}if(filling){const td=e.target.closest?.('td');if(td){const r=+td.parentElement.dataset.row,c=+td.dataset.c;fillTarget=r>filling.r2&&r-filling.r2>=c-filling.c2?{...filling,r2:r}:{...filling,c2:Math.max(c,filling.c2)};const z=at(fillTarget.r2,fillTarget.c2);if(z){const a=at(filling.r1,filling.c1).getBoundingClientRect(),b=z.getBoundingClientRect();selectionBorder.style.width=b.right-a.left+'px';selectionBorder.style.height=b.bottom-a.top+'px'}}return}const tip=e.target.closest?.('td');if(tip&&!tip.title&&full(tip).length>28)tip.title=full(tip);if(dragging){const td=e.target.closest('td');if(td&&td!==current)select(td,false,true)}});document.addEventListener('mouseup',()=>{dragging=false;headerDrag=null;if(filling){const source=filling,target=fillTarget;filling=null;fillTarget=null;pendingFill=target;post({action:'autofill',source:JSON.stringify(source),target:JSON.stringify(target)});return}finishPaint()});document.addEventListener('keyup',e=>{if(e.key.startsWith('Arrow')||e.key==='Tab')finishPaint()});
         document.addEventListener('click',e=>{if(e.target.closest('input,textarea,#filter-menu'))return;const td=e.target.closest('td');if(!td){closeFilter();return}if(!selected.has(td)||!e.isTrusted)select(td,false,e.shiftKey);if(td.classList.contains('fh'))showFilter(td);else closeFilter();if(!e.isTrusted)finishPaint()});
         document.addEventListener('dblclick',e=>{const th=e.target.closest('thead th');if(th?.dataset.c){autoWidth(+th.dataset.c);return}const td=e.target.closest('td');if(td&&!td.classList.contains('fh')){select(td);beginEdit()}});
         document.addEventListener('keydown',e=>{if(e.defaultPrevented)return;if(e.target.closest?.('#filter-menu')){if(e.key==='Escape')closeFilter();return}if(e.target===bar||e.target===nameBox)return;if(editing){if(e.key==='Escape'){e.preventDefault();cancelEdit()}else if(e.key==='Enter'||e.key==='Tab'){e.preventDefault();commit(editing.value,e.key==='Enter'?[0,e.shiftKey?-1:1]:[e.shiftKey?-1:1,0])}return}if(e.target.matches?.('input,textarea'))return;
@@ -812,6 +1577,16 @@ final class Book {
         function autoWidth(c){const col=document.querySelector(`colgroup col[data-c="${c}"]`);if(!col)return;const canvas=document.createElement('canvas'),ctx=canvas.getContext('2d');ctx.font='13px -apple-system';let width=48;for(const row of rows.slice(0,1000)){const td=cellAt(row,c);if(td){ctx.font=getComputedStyle(td).font||'13px -apple-system';width=Math.max(width,ctx.measureText(full(td)).width+24)}}col.style.width=Math.min(620,width)+'px';document.querySelector('table').style.width=[...document.querySelectorAll('colgroup col')].reduce((n,x)=>n+parseFloat(x.style.width),0)+'px'}
         window.autoWidth=autoWidth;
         addEventListener('resize',selectionFurniture);addEventListener('scroll',selectionFurniture,{passive:true});
+        let selectedChart=null,chartDrag=null;
+        function deselectChart(){document.querySelector('.selected-chart')?.classList.remove('selected-chart');selectedChart=null}
+        window.setCharts=html=>{const id=selectedChart;deselectChart();document.getElementById('charts').innerHTML=html;const box=[...document.querySelectorAll('.chart-box')].find(b=>b.dataset.chart===id);if(box){selectedChart=id;box.classList.add('selected-chart');box.focus()}};
+        function headerInfo(th){if(!th)return null;if(th.closest('thead')&&th.dataset.c)return {rows:false,n:+th.dataset.c};if(th.parentElement.dataset.row)return {rows:true,n:+th.parentElement.dataset.row};return null}
+        function selectHeaders(h,n){const lo=Math.min(h.start??h.n,n),hi=Math.max(h.start??h.n,n);if(h.rows){select(rowMap.get(lo)?.querySelector('td'));select(rowMap.get(hi)?.querySelector('td:last-child'),false,true)}else{select(at(+rows[0].dataset.row,lo));select(at(+rows.at(-1).dataset.row,hi),false,true)}}
+        document.addEventListener('contextmenu',e=>{const h=headerInfo(e.target.closest('th'));if(!h)return;e.preventDefault();if(busy||editing)return;const b=current?bounds():null;if(!b||h.n<(h.rows?b.r1:b.c1)||h.n>(h.rows?b.r2:b.c2))selectHeaders(h,h.n);document.getElementById('grid-menu')?.remove();const count=h.rows?bounds().r2-bounds().r1+1:bounds().c2-bounds().c1+1,menu=document.createElement('div');menu.id='grid-menu';for(const [suffix,position] of [['Before','before'],['After','after'],['Delete','delete']]){const button=document.createElement('button');button.textContent=T[(h.rows?'row':'col')+suffix].replaceAll('%N',String(count));if(count===1)button.textContent=T[(h.rows?'row':'col')+suffix+'One'];button.onclick=()=>{menu.remove();post({action:'gridChange',rows:h.rows?'1':'0',position})};menu.append(button)}document.body.append(menu);menu.style.left=Math.max(0,Math.min(e.clientX,innerWidth-menu.offsetWidth))+'px';menu.style.top=Math.max(0,Math.min(e.clientY,innerHeight-menu.offsetHeight))+'px'});
+        document.addEventListener('mousedown',e=>{if(!e.target.closest('#grid-menu'))document.getElementById('grid-menu')?.remove();const box=e.target.closest('.chart-box');if(!box){if(!e.target.closest('#formula-bar'))deselectChart();return}if(busy||editing||e.button!==0)return;e.preventDefault();deselectChart();selectedChart=box.dataset.chart;box.classList.add('selected-chart');box.focus();chartDrag={box,x:e.clientX,y:e.clientY,left:parseFloat(box.style.left),top:parseFloat(box.style.top),width:box.offsetWidth,height:box.offsetHeight,resize:!!e.target.closest('.chart-resize')}});
+        document.addEventListener('mousemove',e=>{if(!chartDrag)return;const d=chartDrag,dx=e.clientX-d.x,dy=e.clientY-d.y;if(d.resize){d.box.style.width=Math.max(120,d.width+dx)+'px';d.box.style.height=Math.max(100,d.height+dy)+'px'}else{d.box.style.left=Math.max(40,d.left+dx)+'px';d.box.style.top=Math.max(66,d.top+dy)+'px'}});
+        document.addEventListener('mouseup',()=>{if(!chartDrag)return;const d=chartDrag;chartDrag=null;const frame={x:parseFloat(d.box.style.left),y:parseFloat(d.box.style.top),width:d.box.offsetWidth,height:d.box.offsetHeight};if(frame.x!==d.left||frame.y!==d.top||frame.width!==d.width||frame.height!==d.height)post({action:'chartFrame',id:d.box.dataset.chart,...Object.fromEntries(Object.entries(frame).map(([k,v])=>[k,String(v)]))})});
+        document.addEventListener('keydown',e=>{if(!selectedChart||e.target.matches?.('input,textarea'))return;if(e.key==='Delete'||e.key==='Backspace'){e.preventDefault();e.stopImmediatePropagation();post({action:'chartDelete',id:selectedChart})}else if(e.key==='Escape'){e.preventDefault();deselectChart()}},true);
         select(rows[0]?.querySelector('td'));
         </script></body></html>
         """
@@ -898,6 +1673,7 @@ final class FormulaParser {
         let chars = Array(s); var i = 0
         func refToken(_ word: String, sheet: Int) -> FToken? {
             let clean = word.replacingOccurrences(of: "$", with: "").uppercased()
+            if clean.range(of:"^[1-9][0-9]{0,6}$",options:.regularExpression) != nil { return .ref(sheet,Int(clean)!,0) }
             guard clean.range(of: "^[A-Z]{1,3}([1-9][0-9]{0,6})?$", options: .regularExpression) != nil else { return nil }
             return .ref(sheet, rowNumber(clean), column(clean))
         }
@@ -919,7 +1695,7 @@ final class FormulaParser {
                 var name = ""; i += 1
                 while i < chars.count { if chars[i] == "'" { if i + 1 < chars.count && chars[i + 1] == "'" { name.append("'"); i += 2; continue }; break }; name.append(chars[i]); i += 1 }
                 guard i + 1 < chars.count, chars[i + 1] == "!" else { throw FormulaInvalid() }
-                i += 2; var word = ""
+                i += 2; if String(chars[i...]).hasPrefix("#REF!") { tokens.append(.error("#REF!")); i += 5; continue }; var word = ""
                 while i < chars.count, chars[i].isLetter || chars[i].isNumber || chars[i] == "$" { word.append(chars[i]); i += 1 }
                 guard let t = refToken(word, sheet: try sheetIndex(name)) else { throw FormulaUnsupported() }
                 tokens.append(t); continue
@@ -938,7 +1714,7 @@ final class FormulaParser {
                 while i < chars.count, chars[i].isLetter || chars[i].isNumber || chars[i] == "." || chars[i] == "_" || chars[i] == "$" { word.append(chars[i]); i += 1 }
                 let isCall = chars.dropFirst(i).first(where:{ !$0.isWhitespace }) == "("
                 if i < chars.count && chars[i] == "!" {
-                    i += 1; var ref = ""
+                    i += 1; if String(chars[i...]).hasPrefix("#REF!") { tokens.append(.error("#REF!")); i += 5; continue }; var ref = ""
                     while i < chars.count, chars[i].isLetter || chars[i].isNumber || chars[i] == "$" { ref.append(chars[i]); i += 1 }
                     guard let t = refToken(ref, sheet: try sheetIndex(word)) else { throw FormulaUnsupported() }
                     tokens.append(t)
@@ -1019,11 +1795,14 @@ final class FormulaParser {
         guard let t = peek else { throw FormulaInvalid() }
         pos += 1
         switch t {
-        case .num(let n): return FValue.number(n).excelValue
+        case .num(let n):
+            if peek == .colon { guard n.isFinite,n == n.rounded(),n>=1,n<=1048576 else { throw FormulaInvalid() }; return try wholeRows(sheet,Int(n)) }
+            return FValue.number(n).excelValue
         case .str(let s): return .text(s)
         case .error(let e): return .error(e)
         case .lp: let v = try comparison(); guard take(.rp) else { throw FormulaInvalid() }; return v
         case .ref(let s, let r, let c):
+            if c == 0 { return try wholeRows(s,r) }
             if take(.colon) {
                 guard case .ref(let s2, let r2, let c2)? = peek, s2 == sheet || s2 == s, (r == 0) == (r2 == 0) else { throw FormulaInvalid() }
                 pos += 1
@@ -1048,6 +1827,17 @@ final class FormulaParser {
             return validating ? .empty : try call(name,args)
         default: throw FormulaInvalid()
         }
+    }
+    func wholeRows(_ s: Int, _ first: Int) throws -> FValue {
+        guard take(.colon),let token = peek else { throw FormulaInvalid() }
+        let last: Int
+        switch token { case .num(let n): guard n == n.rounded(),n>0,n<=1048576 else { throw FormulaInvalid() }; last = Int(n)
+        case .ref(_,let r,0): last = r
+        default: throw FormulaInvalid() }
+        pos += 1; if validating { return .empty }
+        guard first>0,first<=1048576 else { return .error("#REF!") }
+        let width = max(1,try book.index(s).maxCol), lo = min(first,last),hi = max(first,last)
+        return .range(try book.rangeValues(s,lo,1,hi,width),hi-lo+1,width)
     }
     func compare(_ a: FValue, _ op: String, _ b: FValue) -> Bool {
         func scalar(_ v: FValue) -> FValue { switch v { case .range(let l,_,_), .list(let l): return l.first ?? .empty; default: return v } }
@@ -1482,6 +2272,12 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
     @objc func undoEdit() { editUndo.undo(); updateEditState(); web.evaluateJavaScript("editResult(true,'')",completionHandler:nil) }
     @objc func redoEdit() { editUndo.redo(); updateEditState(); web.evaluateJavaScript("editResult(true,'')",completionHandler:nil) }
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        if item.action == #selector(gridMenu(_:)),let command = item.representedObject as? String {
+            let parts = command.split(separator:":"),rows = parts[0] == "row",count = rows ? selectedRange.r2-selectedRange.r1+1 : selectedRange.c2-selectedRange.c1+1
+            item.title = gridActionTitle(rows:rows,count:count,deleting:parts[1] == "delete",after:parts[1] == "after")
+            return book != nil && !loading
+        }
+        if item.action == #selector(createChartMenu(_:)) { return book != nil && !loading && selectedRange.count>1 }
         switch item.action {
         case #selector(undoEdit): return NSApp.modalWindow != nil || editUndo.canUndo
         case #selector(redoEdit): return NSApp.modalWindow != nil || editUndo.canRedo
@@ -1489,6 +2285,50 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
         case #selector(editCell): return book != nil && !selectedRef.isEmpty && !loading
         default: return true
         }
+    }
+    // Package actions share one undo record, including all dependent sheet/chart/table parts.
+    func packageAction(_ name: String, _ action: (Book,Int) throws -> Void, reload: Bool = false) {
+        guard let book,!loading else { return }
+        do {
+            try book.preparePackage()
+            let old = try book.packageSnapshot(),generation = savedGeneration
+            do { try action(book,picker.indexOfSelectedItem) } catch { try book.restorePackage(old); throw error }
+            committedActions += 1
+            editUndo.record(self,name:name) { $0.restoreWorkbook(old,generation:generation,reload:reload) }
+            if reload { reloadGrid() } else { refreshCharts() }
+            updateEditState(); lastEditError = ""; web.evaluateJavaScript("editResult(true,'')",completionHandler:nil)
+        } catch { editError(error) }
+    }
+    func restoreWorkbook(_ state: PackageSnapshot, generation: Int, reload: Bool) {
+        guard let book else { return }
+        do {
+            let inverse = try book.packageSnapshot(),inverseGeneration = savedGeneration
+            try book.restorePackage(state); book.dirty = state.dirty || generation != savedGeneration
+            editUndo.registerUndo(withTarget:self) { $0.restoreWorkbook(inverse,generation:inverseGeneration,reload:reload) }
+            if reload { reloadGrid() } else { refreshCharts() }; updateEditState()
+        } catch { editError(error) }
+    }
+    var pendingGridSelection: CellRange?
+    func reloadGrid() {
+        guard let book else { return }
+        do { pendingGridSelection = selectedRange; show(try book.render(picker.indexOfSelectedItem)) } catch { editError(error) }
+    }
+    func refreshCharts() {
+        guard let book,let html = try? book.chartHTML(picker.indexOfSelectedItem) else { return }
+        web.evaluateJavaScript("window.setCharts&&setCharts(\(jsonString(html)))",completionHandler:nil)
+    }
+    func changeGrid(rows: Bool, position: String) {
+        let lo = rows ? selectedRange.r1 : selectedRange.c1,hi = rows ? selectedRange.r2 : selectedRange.c2
+        let deleting = position == "delete",change = GridChange(rows:rows,at:position == "after" ? hi+1 : lo,count:hi-lo+1,deleting:deleting)
+        packageAction(gridActionTitle(rows:rows,count:change.count,deleting:deleting,after:position == "after"),{ book,i in try book.shiftGrid(i,change:change) },reload:true)
+    }
+    @objc func gridMenu(_ sender: NSMenuItem) {
+        guard let command = sender.representedObject as? String else { return }; let parts = command.split(separator:":")
+        changeGrid(rows:parts[0] == "row",position:String(parts[1]))
+    }
+    @objc func createChartMenu(_ sender: NSMenuItem) {
+        guard let kind = sender.representedObject as? String else { return }
+        packageAction(L("Inserisci grafico","Insert Chart"),{ book,i in _ = try book.createChart(i,range:self.selectedRange,kind:kind) })
     }
     func restoreSheet(_ index: Int, _ data: Data, dirty: Bool, refs: [String] = [], generation: Int? = nil) {
         guard let book else { return }
@@ -1555,7 +2395,7 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
             updates.append([r,c,value,editedKeys.contains(key) ? 1 : 0,raw,numeric,cell.map { book.style($0).css } ?? ""])
         }
         guard let data = try? JSONSerialization.data(withJSONObject:updates), let json = String(data:data,encoding:.utf8) else { return }
-        web.evaluateJavaScript("setCells(\(json))",completionHandler:nil)
+        web.evaluateJavaScript("setCells(\(json))",completionHandler:nil); refreshCharts()
         if !selectedRef.isEmpty { let selected = idx.cells[cellKey(rowNumber(selectedRef),column(selectedRef))] ?? idx.blankCells[cellKey(rowNumber(selectedRef),column(selectedRef))]; showDetail(selectedRef,selected.map { book.display($0,sheet:index) } ?? "") }
     }
     func selectedEdits(_ text: String) throws -> [CellEdit] {
@@ -1609,8 +2449,8 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
     func persist(to target: URL) throws {
         guard let book else { return }
         try book.save(to:target)
-        book.url = target; book.untitled = false; book.dirty = false; savedGeneration += 1
-        for i in book.sheets.indices { if let doc = book.documents[book.sheets[i].path] { for c in doc.nodes("/worksheet/sheetData/row/c[f]") { if let cell = c as? XMLElement, (try? book.computed(cell,sheet:i)) != nil { c.nodes("v").forEach { $0.detach() } } } } }; book.invalidate()
+        book.url = target; book.originalMembers = nil; book.untitled = false; book.dirty = false; savedGeneration += 1
+        for i in book.sheets.indices { if let doc = book.documents[book.sheets[i].path] { for c in doc.rootElement()?.child("sheetData")?.kids("row").flatMap({ $0.kids("c") }) ?? [] where c.child("f") != nil { if (try? book.computed(c,sheet:i)) != nil { c.kids("v").forEach { $0.detach() } } } } }; book.invalidate()
         window.title = target.lastPathComponent; window.representedURL = target
         UserDefaults.standard.set(target.path,forKey:"lastFile"); NSDocumentController.shared.noteNewRecentDocumentURL(target); refreshRecentMenu(); updateEditState()
     }
@@ -1856,6 +2696,13 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
         case "undo": undoEdit()
         case "redo": redoEdit()
         case "sort": sortSelection(data["ascending"] == "1",column:Int(data["col"] ?? ""))
+        case "gridChange": changeGrid(rows:data["rows"] == "1",position:data["position"] ?? "before")
+        case "chartFrame":
+            guard let id = data["id"],let x = Double(data["x"] ?? ""),let y = Double(data["y"] ?? ""),let w = Double(data["width"] ?? ""),let h = Double(data["height"] ?? "") else { return }
+            packageAction(L("Sposta/ridimensiona grafico","Move/Resize Chart"),{ book,i in try book.setChartFrame(i,id:id,frame:CGRect(x:x,y:y,width:w,height:h)) })
+        case "chartDelete":
+            guard let id = data["id"] else { return }
+            packageAction(L("Elimina grafico","Delete Chart"),{ book,i in try book.deleteChart(i,id:id) })
         case "fillDown": fillDown()
         case "paint": if let style = paintStyle { paintStyle = nil; formatSelection(.copy(style)); web.evaluateJavaScript("armPaint(false)",completionHandler:nil) }
         case "cancelPaint": paintStyle = nil
@@ -1908,6 +2755,12 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
         add(edit, L("Cerca…", "Find…"), #selector(focusSearch), "f", target: self)
         add(edit, L("Trova successivo", "Find Next"), #selector(findNext), "g", target: self)
         add(edit, L("Trova precedente", "Find Previous"), #selector(findPrevious), "g", [.command, .shift], target: self)
+        func gridItems(_ menu: NSMenu, includeDelete: Bool) {
+            for rows in [true,false] { for position in (includeDelete ? ["before","after","delete"] : ["before","after"]) {
+                let item = menu.addItem(withTitle:gridActionTitle(rows:rows,count:1,deleting:position == "delete",after:position == "after"),action:#selector(gridMenu(_:)),keyEquivalent:""); item.target = self; item.representedObject = (rows ? "row:" : "col:")+position
+            } }
+        }
+        edit.addItem(.separator()); gridItems(edit,includeDelete:true)
         let view = submenu(L("Visualizza", "View"))
         add(view,L("Blocca/sblocca prima riga","Freeze/Unfreeze First Row"),#selector(toggleFreeze),target:self)
         add(view,L("Adatta larghezza colonna","Fit Column Width"),#selector(autoWidth),target:self)
@@ -1921,6 +2774,9 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
         add(view, L("Schermo intero", "Enter Full Screen"), #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control])
         let insert = submenu(L("Inserisci","Insert"))
         for (title,name) in [(L("Somma","Sum"),"SUM"),(L("Media","Average"),"AVERAGE"),(L("Conta numeri","Count numbers"),"COUNT"),(L("Massimo","Maximum"),"MAX"),(L("Minimo","Minimum"),"MIN")] { let item = insert.addItem(withTitle:title,action:#selector(formatMenu(_:)),keyEquivalent:""); item.target = self; item.representedObject = "aggregate:"+name }
+        insert.addItem(.separator()); gridItems(insert,includeDelete:false)
+        let chartItem = NSMenuItem(title:L("Grafico","Chart"),action:nil,keyEquivalent:""),chartMenu = NSMenu(title:L("Grafico","Chart")); chartItem.submenu = chartMenu; insert.addItem(chartItem)
+        for (title,kind) in [(L("Colonne","Column"),"column"),(L("Barre","Bar"),"bar"),(L("Linee","Line"),"line"),(L("Torta","Pie"),"pie")] { let item = chartMenu.addItem(withTitle:title,action:#selector(createChartMenu(_:)),keyEquivalent:""); item.target = self; item.representedObject = kind }
         let format = submenu(L("Formato","Format"))
         for (title,key,command) in [(L("Grassetto","Bold"),"b","bold"),(L("Corsivo","Italic"),"i","italic"),(L("Barrato","Strikethrough"),"","strike"),(L("Testo a capo","Wrap text"),"","wrap")] { let item = format.addItem(withTitle:title,action:#selector(formatMenu(_:)),keyEquivalent:key); item.target = self; item.representedObject = command }
         format.addItem(.separator())
@@ -2056,7 +2912,9 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
             }
         }
     }
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { webView.pageZoom = zoom; if paintStyle != nil { web.evaluateJavaScript("armPaint(true)",completionHandler:nil) } }
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { webView.pageZoom = zoom;
+        if let range = pendingGridSelection { pendingGridSelection = nil; web.evaluateJavaScript("select(ensure(\(range.r1),\(range.c1)));select(ensure(\(range.r2),\(range.c2)),true,true)",completionHandler:nil) }
+ if paintStyle != nil { web.evaluateJavaScript("armPaint(true)",completionHandler:nil) } }
     func show(_ error: Error) { NSAlert(error: error).runModal() }
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         if let url = action.request.url, url.isFileURL, supportedExtensions.contains(url.pathExtension.lowercased()) { decisionHandler(.cancel); load(url); return }
@@ -2065,6 +2923,9 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
 }
 
 #if DEBUG
+if CommandLine.arguments.count > 2 && CommandLine.arguments[1] == "--model-test-v13" {
+    do { try runV13ModelTests(URL(fileURLWithPath:CommandLine.arguments[2])) } catch { fputs("FAIL: \(error)\n",stderr); exit(1) }; exit(0)
+}
 if CommandLine.arguments.count > 2 && CommandLine.arguments[1] == "--model-test" {
     runSheetModelTests(URL(fileURLWithPath:CommandLine.arguments[2])); exit(0)
 }

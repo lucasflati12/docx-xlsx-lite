@@ -11,6 +11,511 @@ private let wordNamespace = "http://schemas.openxmlformats.org/wordprocessingml/
 let wordParagraphStyleKey = NSAttributedString.Key("DOCXLiteParagraphStyle")
 private let wordStyleIDs = ["Normal", "Title", "Heading1", "Heading2", "Heading3"]
 
+let docxPackageKey = NSAttributedString.Key("DOCXLitePackage")
+let docxAnchorKey = NSAttributedString.Key("DOCXLiteAnchor")
+private let relationshipNamespace = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+private let retainedAnchorNames: Set<String> = ["commentRangeStart", "commentRangeEnd", "commentReference", "footnoteReference", "endnoteReference", "bookmarkStart", "bookmarkEnd"]
+
+private func wordDescendants(_ node: XMLNode, named name: String) -> [XMLElement] {
+    var result: [XMLElement] = [], stack = Array((node.children ?? []).reversed())
+    while let child = stack.popLast() {
+        if child.localName == name, let element = child as? XMLElement { result.append(element) }
+        stack.append(contentsOf: (child.children ?? []).reversed())
+    }
+    return result
+}
+private func parsePart(_ data: Data) throws -> XMLDocument {
+    try XMLDocument(data: data, options: [.nodePreserveWhitespace, .nodeLoadExternalEntitiesNever])
+}
+private func partPath(_ target: String, relativeTo part: String = "word/document.xml") -> String {
+    let path = target.hasPrefix("/") ? target : "/" + (part as NSString).deletingLastPathComponent + "/" + target
+    return String(URL(fileURLWithPath: path).standardizedFileURL.path.dropFirst())
+}
+private func documentTarget(_ path: String) -> String { path.hasPrefix("word/") ? String(path.dropFirst(5)) : "../" + path }
+private func relationshipKind(_ node: XMLElement) -> String { node.attribute(forName: "Type")?.stringValue?.split(separator: "/").last.map(String.init) ?? "" }
+private func packageEntries(_ url: URL) throws -> Set<String> {
+    let task = Process(); task.executableURL = URL(fileURLWithPath: "/usr/bin/unzip"); task.arguments = ["-Z1", url.path]
+    let pipe = Pipe(); task.standardOutput = pipe; task.standardError = FileHandle.nullDevice
+    let done = try startProcess(task); let bytes = pipe.fileHandleForReading.readDataToEndOfFile(); done.wait()
+    guard task.terminationStatus == 0 else { throw structureError() }
+    return Set(String(decoding: bytes, as: UTF8.self).split(separator: "\n").map(String.init).filter { !$0.hasSuffix("/") })
+}
+private func standaloneXML(_ node: XMLElement, root: XMLElement?) -> Data {
+    let copy = node.copy() as! XMLElement
+    for namespace in root?.namespaces ?? [] { copy.addNamespace(namespace.copy() as! XMLNode) }
+    return Data(copy.xmlString.utf8)
+}
+private func partText(_ data: Data?) -> String {
+    guard let data, let xml = try? parsePart(data), let root = xml.rootElement() else { return "" }
+    return wordDescendants(root, named: "p").map { wordDescendants($0, named: "t").compactMap { $0.stringValue }.joined() }.joined(separator: "\n")
+}
+
+final class DOCXAnchor: NSObject, NSSecureCoding {
+    static var supportsSecureCoding: Bool { true }
+    let owner: String, kind: String, id: String, xml: Data, properties: Data?, label: String, detail: String
+    init(owner: String, kind: String, id: String, xml: Data, properties: Data? = nil, label: String = "", detail: String = "") {
+        self.owner = owner; self.kind = kind; self.id = id; self.xml = xml; self.properties = properties; self.label = label; self.detail = detail
+    }
+    required convenience init?(coder: NSCoder) {
+        guard let owner = coder.decodeObject(of: NSString.self, forKey: "owner") as String?, let kind = coder.decodeObject(of: NSString.self, forKey: "kind") as String?, let id = coder.decodeObject(of: NSString.self, forKey: "id") as String?, let xml = coder.decodeObject(of: NSData.self, forKey: "xml") as Data? else { return nil }
+        self.init(owner: owner, kind: kind, id: id, xml: xml, properties: coder.decodeObject(of: NSData.self, forKey: "properties") as Data?, label: coder.decodeObject(of: NSString.self, forKey: "label") as String? ?? "", detail: coder.decodeObject(of: NSString.self, forKey: "detail") as String? ?? "")
+    }
+    func encode(with coder: NSCoder) {
+        coder.encode(owner, forKey: "owner"); coder.encode(kind, forKey: "kind"); coder.encode(id, forKey: "id"); coder.encode(xml, forKey: "xml")
+        coder.encode(properties, forKey: "properties"); coder.encode(label, forKey: "label"); coder.encode(detail, forKey: "detail")
+    }
+    var visible: Bool { ["commentReference", "footnoteReference", "endnoteReference"].contains(kind) }
+    var key: String { kind + ":" + id }
+}
+
+// Original compressed bytes are immutable during editing/saving. Only the media
+// lookup is populated during import, before this object enters attributed text.
+final class DOCXPackage: NSObject {
+    let identity = UUID().uuidString
+    let archive: Data
+    let entries: Set<String>
+    let parts: [String: Data]
+    let relationships: [XMLElement]
+    let finalSection: Data?
+    let sectionSize: NSSize?
+    let leftMargin: CGFloat?
+    let headerText: String, footerText: String, headerDetails: String, footerDetails: String
+    let unsupported: [String]
+    let nextDrawingID: Int
+    private let notes: [String: [String: String]]
+    let expectedComments: [String: Set<String>]
+    let originalFootnotes: Set<String>, originalEndnotes: Set<String>
+    private(set) var knownMedia: [Data: String] = [:]
+
+    func relatedPart(_ kind: String) -> String? {
+        guard let relation = relationships.first(where: { relationshipKind($0) == kind && $0.attribute(forName: "TargetMode")?.stringValue != "External" }), let target = relation.attribute(forName: "Target")?.stringValue else { return nil }
+        return partPath(target)
+    }
+    func noteText(_ kind: String, id: String) -> String { notes[kind]?[id] ?? "" }
+    func recordMedia(_ data: Data, path: String) { if knownMedia[data] == nil { knownMedia[data] = path } }
+
+    init(url: URL) throws {
+        archive = try Data(contentsOf: url); entries = try packageEntries(url)
+        var loaded: [String: Data] = [:]
+        for path in ["word/document.xml", "word/_rels/document.xml.rels", "[Content_Types].xml"] where entries.contains(path) { loaded[path] = try archiveMember(url, path) }
+        let rels = try loaded["word/_rels/document.xml.rels"].map(parsePart)
+        let sourceRelations = rels?.rootElement()?.children?.compactMap { ($0 as? XMLElement)?.copy() as? XMLElement } ?? []
+        relationships = sourceRelations
+        let metadata: Set<String> = ["styles", "numbering", "comments", "commentsExtended", "commentsIds", "commentsExtensible", "people", "footnotes", "endnotes", "settings"]
+        for relation in sourceRelations where metadata.contains(relationshipKind(relation)) && relation.attribute(forName: "TargetMode")?.stringValue != "External" {
+            if let target = relation.attribute(forName: "Target")?.stringValue { let path = partPath(target); if entries.contains(path) { loaded[path] = try archiveMember(url, path) } }
+        }
+        for path in entries where path.hasPrefix("word/header") && path.hasSuffix(".xml") || path.hasPrefix("word/footer") && path.hasSuffix(".xml") { loaded[path] = try archiveMember(url, path) }
+        parts = loaded
+        nextDrawingID = (loaded.values.flatMap { data -> [Int] in
+            guard let xml = try? parsePart(data) else { return [] }
+            return wordDescendants(xml, named: "docPr").compactMap { ($0.attribute(forName: "id")?.stringValue).flatMap(Int.init) }
+        }.max() ?? 0) + 1
+        var noteTexts: [String: [String: String]] = [:]
+        for (kind, singular) in [("comments", "comment"), ("footnotes", "footnote"), ("endnotes", "endnote")] {
+            if let relation = sourceRelations.first(where: { relationshipKind($0) == kind }), let target = relation.attribute(forName: "Target")?.stringValue, let data = loaded[partPath(target)], let noteXML = try? parsePart(data), let noteRoot = noteXML.rootElement() {
+                for note in wordDescendants(noteRoot, named: singular) {
+                    if let id = xmlValue(note, "id") { noteTexts[kind, default: [:]][id] = wordDescendants(note, named: "p").map { wordDescendants($0, named: "t").compactMap { $0.stringValue }.joined() }.joined(separator: "\n") }
+                }
+            }
+        }
+        notes = noteTexts
+        let document = try parsePart(loaded["word/document.xml"] ?? Data())
+        let root = document.rootElement()!
+        let sections = wordDescendants(root, named: "sectPr").filter { $0.parent?.localName == "pPr" || $0.parent?.localName == "body" }
+        finalSection = sections.last(where: { $0.parent?.localName == "body" }).map { standaloneXML($0, root: root) }
+        let first = sections.first
+        let size = first?.children?.first(where: { $0.localName == "pgSz" }) as? XMLElement
+        if let width = Double(xmlValue(size, "w") ?? ""), let height = Double(xmlValue(size, "h") ?? "") { sectionSize = NSSize(width: width / 20, height: height / 20) } else { sectionSize = nil }
+        let margin = first?.children?.first(where: { $0.localName == "pgMar" }) as? XMLElement
+        leftMargin = Double(xmlValue(margin, "left") ?? "").map { CGFloat($0 / 20) }
+        func preview(_ kind: String) -> (String, String) {
+            let references = first?.children?.compactMap { $0 as? XMLElement }.filter { $0.localName == kind + "Reference" } ?? []
+            let firstPage = first?.children?.contains { $0.localName == "titlePg" } ?? false
+            let preferred = references.first { xmlValue($0, "type") == (firstPage ? "first" : "default") } ?? references.first
+            func text(_ reference: XMLElement?) -> String {
+                guard let id = xmlValue(reference, "id"), let relation = sourceRelations.first(where: { $0.attribute(forName: "Id")?.stringValue == id }), let target = relation.attribute(forName: "Target")?.stringValue else { return "" }
+                return partText(loaded[partPath(target)])
+            }
+            return (text(preferred).replacingOccurrences(of: "\n", with: " · "), references.map { text($0) }.filter { !$0.isEmpty }.joined(separator: "\n"))
+        }
+        let header = preview("header"), footer = preview("footer")
+        headerText = header.0; headerDetails = header.1; footerText = footer.0; footerDetails = footer.1
+        var comments: [String: Set<String>] = [:], footnotes = Set<String>(), endnotes = Set<String>(), names = Set<String>()
+        var stack: [XMLNode] = [root]
+        while let node = stack.popLast() {
+            if let name = node.localName { names.insert(name)
+                if let element = node as? XMLElement, let id = xmlValue(element, "id") {
+                    if name.hasPrefix("commentRange") || name == "commentReference" { comments[id, default: []].insert(name) }
+                    if name == "footnoteReference" { footnotes.insert(id) }
+                    if name == "endnoteReference" { endnotes.insert(id) }
+                }
+            }
+            stack.append(contentsOf: node.children ?? [])
+        }
+        expectedComments = comments; originalFootnotes = footnotes; originalEndnotes = endnotes
+        var issues: [String] = []
+        let settingsPath = sourceRelations.first(where: { relationshipKind($0) == "settings" })?.attribute(forName: "Target")?.stringValue.map { partPath($0) }
+        let settings = settingsPath.flatMap { loaded[$0] }.flatMap { try? parsePart($0) }?.rootElement()
+        let trackEnabled = settings.flatMap { wordDescendants($0, named: "trackRevisions").first }.map { !["0", "false", "off"].contains(xmlValue($0, "val") ?? "1") } ?? false
+        if !names.isDisjoint(with: ["ins", "del", "moveFrom", "moveTo"]) || names.contains(where: { $0.hasSuffix("Change") || $0.hasPrefix("moveFrom") || $0.hasPrefix("moveTo") }) || trackEnabled { issues.append(L("Revisioni e modifiche tracciate", "Tracked changes")) }
+        if !names.isDisjoint(with: ["txbxContent", "shape", "wsp", "wgp"]) { issues.append(L("Caselle di testo e forme", "Text boxes and shapes")) }
+        if names.contains("anchor") { issues.append(L("Oggetti e immagini flottanti", "Floating objects and images")) }
+        if names.contains("relIds") { issues.append(L("SmartArt", "SmartArt")) }
+        if names.contains("chart") { issues.append(L("Grafici", "Charts")) }
+        if !names.isDisjoint(with: ["oMath", "oMathPara"]) { issues.append(L("Equazioni", "Equations")) }
+        if !names.isDisjoint(with: ["object", "OLEObject", "altChunk"]) { issues.append(L("Oggetti incorporati", "Embedded objects")) }
+        if names.contains("sdt") { issues.append(L("Controlli contenuto", "Content controls")) }
+        if !names.isDisjoint(with: ["fldChar", "fldSimple", "instrText"]) { issues.append(L("Campi automatici nel testo", "Automatic fields in document text")) }
+        if wordDescendants(root, named: "tbl").contains(where: { ancestor($0.parent ?? $0, named: "tbl") != nil }) { issues.append(L("Tabelle annidate o complesse", "Nested or complex tables")) }
+        unsupported = issues
+    }
+}
+private func packageInText(_ text: NSAttributedString) -> DOCXPackage? {
+    var package: DOCXPackage?
+    text.enumerateAttribute(docxPackageKey, in: NSRange(location: 0, length: text.length)) { value, _, stop in
+        if let found = value as? DOCXPackage { package = found; stop.pointee = true }
+    }
+    return package
+}
+
+private struct ImportedAnchor { let marker: String; let anchor: DOCXAnchor }
+private func prepareRetainedAnchors(_ xml: XMLDocument, package: DOCXPackage?) throws -> [ImportedAnchor] {
+    guard let package, let root = xml.rootElement() else { return [] }
+    var result: [ImportedAnchor] = [], counters: [String: Int] = [:]
+    let nodes = try xml.nodes(forXPath: "//*[local-name()='commentRangeStart' or local-name()='commentRangeEnd' or local-name()='commentReference' or local-name()='footnoteReference' or local-name()='endnoteReference' or local-name()='bookmarkStart' or local-name()='bookmarkEnd' or local-name()='sectPr']")
+    for case let node as XMLElement in nodes {
+        guard let kind = node.localName else { continue }
+        if kind == "sectPr", node.parent?.localName == "body" { node.detach(); continue }
+        guard retainedAnchorNames.contains(kind) || kind == "sectPr", let parent = node.parent as? XMLElement else { continue }
+        let id = xmlValue(node, "id") ?? "section\(result.count)"
+        let properties = kind.hasSuffix("Reference") ? parent.children?.first(where: { $0.localName == "rPr" }) as? XMLElement : nil
+        var label = "", detail = ""
+        if kind == "commentReference" { detail = package.noteText("comments", id: id) }
+        if kind == "footnoteReference" || kind == "endnoteReference" {
+            counters[kind, default: 0] += 1; label = String(counters[kind]!)
+            detail = package.noteText(kind == "footnoteReference" ? "footnotes" : "endnotes", id: id)
+        }
+        let anchor = DOCXAnchor(owner: package.identity, kind: kind, id: id, xml: standaloneXML(node, root: root), properties: properties.map { standaloneXML($0, root: root) }, label: label, detail: detail)
+        let marker = "DOCXLITEKEEP" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        let text = wordElement("t"); text.stringValue = marker
+        if kind == "sectPr" {
+            let paragraph = ancestor(parent, named: "p")!
+            node.detach(); let run = wordElement("r"); run.addChild(text); paragraph.addChild(run)
+        } else if parent.localName == "r" { parent.replaceChild(at: node.index, with: text) }
+        else { let run = wordElement("r"); run.addChild(text); parent.replaceChild(at: node.index, with: run) }
+        result.append(ImportedAnchor(marker: marker, anchor: anchor))
+    }
+    return result
+}
+private func anchorImage(_ anchor: DOCXAnchor) -> NSImage {
+    if anchor.kind == "commentReference" {
+        let image = NSImage(systemSymbolName: "text.bubble", accessibilityDescription: L("Commento", "Comment"))!.copy() as! NSImage
+        image.size = NSSize(width: 12, height: 12); return image
+    }
+    let label = anchor.label as NSString, font = NSFont(name: "Arial", size: 9)!
+    return NSImage(size: NSSize(width: max(8, ceil(label.size(withAttributes: [.font: font]).width) + 2), height: 12), flipped: false) { _ in
+        label.draw(at: NSPoint(x: 1, y: 2), withAttributes: [.font: font, .foregroundColor: NSColor.darkGray]); return true
+    }
+}
+private func restoreRetainedAnchors(_ items: [ImportedAnchor], in text: NSMutableAttributedString, package: DOCXPackage?) {
+    for item in items {
+        let range = (text.string as NSString).range(of: item.marker)
+        guard range.location != NSNotFound else { continue }
+        var attributes = text.attributes(at: range.location, effectiveRange: nil)
+        attributes[docxAnchorKey] = item.anchor
+        let replacement: NSMutableAttributedString
+        if item.anchor.visible {
+            let attachment = NSTextAttachment(); attachment.attachmentCell = NSTextAttachmentCell(imageCell: anchorImage(item.anchor))
+            replacement = NSMutableAttributedString(attachment: attachment)
+            attributes[.toolTip] = item.anchor.detail
+            attributes[.font] = NSFont(name: "Arial", size: 9)!
+            attributes[.baselineOffset] = item.anchor.kind == "commentReference" ? 0 : 3
+        } else {
+            replacement = NSMutableAttributedString(string: "\u{2060}")
+            attributes[.font] = NSFont(name: "Arial", size: 0.1)!
+            attributes[.foregroundColor] = NSColor.clear
+        }
+        replacement.addAttributes(attributes, range: NSRange(location: 0, length: replacement.length))
+        text.replaceCharacters(in: range, with: replacement)
+    }
+    if let package, text.length > 0 { text.addAttribute(docxPackageKey, value: package, range: NSRange(location: 0, length: text.length)) }
+}
+
+private struct ExportRetainedAnchor { let position: Int; let marker: String; let anchor: DOCXAnchor }
+private struct RetainedAnchors {
+    let kept: [ExportRetainedAnchor]
+    let positions: Set<Int>
+    let comments: Set<String>, footnotes: Set<String>, endnotes: Set<String>
+}
+private func retainedAnchors(in text: NSAttributedString, package: DOCXPackage?) -> RetainedAnchors {
+    var records: [ExportRetainedAnchor] = [], positions = Set<Int>(), seen = Set<String>(), comments: [String: Set<String>] = [:], bookmarks: [String: Set<String>] = [:]
+    let source = text.string as NSString
+    text.enumerateAttribute(docxAnchorKey, in: NSRange(location: 0, length: text.length)) { value, range, _ in
+        guard let anchor = value as? DOCXAnchor else { return }
+        for position in range.location..<NSMaxRange(range) where source.character(at: position) == (anchor.visible ? 0xfffc : 0x2060) {
+            positions.insert(position)
+            guard anchor.owner == package?.identity, seen.insert(anchor.key).inserted else { continue }
+            records.append(ExportRetainedAnchor(position: position, marker: "DOCXLITEKEEP" + UUID().uuidString.replacingOccurrences(of: "-", with: ""), anchor: anchor))
+            if anchor.kind.hasPrefix("comment") { comments[anchor.id, default: []].insert(anchor.kind) }
+            if anchor.kind.hasPrefix("bookmark") { bookmarks[anchor.id, default: []].insert(anchor.kind) }
+        }
+    }
+    let commentIDs = Set(comments.compactMap { id, roles in roles == package?.expectedComments[id] && roles.contains("commentReference") ? id : nil })
+    let bookmarkIDs = Set(bookmarks.compactMap { id, roles in roles == Set(["bookmarkStart", "bookmarkEnd"]) ? id : nil })
+    let kept = records.filter { record in
+        if record.anchor.kind.hasPrefix("comment") { return commentIDs.contains(record.anchor.id) }
+        if record.anchor.kind.hasPrefix("bookmark") { return bookmarkIDs.contains(record.anchor.id) }
+        return true
+    }
+    return RetainedAnchors(kept: kept, positions: positions, comments: commentIDs, footnotes: Set(kept.filter { $0.anchor.kind == "footnoteReference" }.map { $0.anchor.id }), endnotes: Set(kept.filter { $0.anchor.kind == "endnoteReference" }.map { $0.anchor.id }))
+}
+func documentPlainText(_ text: NSAttributedString) -> String {
+    let result = NSMutableString(string: ""), source = text.string as NSString
+    text.enumerateAttribute(docxAnchorKey, in: NSRange(location: 0, length: text.length)) { value, range, _ in
+        guard let anchor = value as? DOCXAnchor else { result.append(source.substring(with: range)); return }
+        var start = range.location
+        for position in range.location..<NSMaxRange(range) where source.character(at: position) == (anchor.visible ? 0xfffc : 0x2060) {
+            if position > start { result.append(source.substring(with: NSRange(location: start, length: position - start))) }; start = position + 1
+        }
+        if start < NSMaxRange(range) { result.append(source.substring(with: NSRange(location: start, length: NSMaxRange(range) - start))) }
+    }
+    return result as String
+}
+
+private func xmlSignature(_ node: XMLNode) -> String {
+    if let element = node as? XMLElement {
+        let attrs = (element.attributes ?? []).map { ($0.localName ?? $0.name ?? "") + "=" + ($0.stringValue ?? "") }.sorted().joined(separator: "|")
+        return "<" + (element.localName ?? "") + attrs + ">" + (element.children ?? []).map(xmlSignature).joined() + "</>"
+    }
+    let string = node.stringValue ?? ""
+    return string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : string
+}
+private func entrySignature(_ element: XMLElement, id: String) -> String {
+    let copy = element.copy() as! XMLElement
+    for attribute in copy.attributes ?? [] where attribute.localName == id || attribute.localName == "default" { attribute.detach() }
+    return xmlSignature(copy)
+}
+private func remapWordValues(_ root: XMLNode, names: Set<String>, values: [String: String]) {
+    var stack = [root]
+    while let node = stack.popLast() {
+        if let element = node as? XMLElement, names.contains(element.localName ?? ""), let old = xmlValue(element, "val"), let new = values[old] { setXML(element, ["w:val": new]) }
+        stack.append(contentsOf: node.children ?? [])
+    }
+}
+private func putPart(_ data: Data, path: String, temporary: URL) throws {
+    let url = temporary.appendingPathComponent(path)
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try data.write(to: url)
+}
+
+private func mergeRetainedPackage(_ package: DOCXPackage, xml: XMLDocument, rels: XMLDocument, content: XMLDocument, temporary: URL, archive: URL, members: inout [String], anchors: RetainedAnchors) throws {
+    let generatedRelations = rels.rootElement()?.children?.compactMap { $0 as? XMLElement } ?? []
+    let generatedTypes = content.rootElement()?.children?.compactMap { $0 as? XMLElement } ?? []
+    let originalRels = try package.parts["word/_rels/document.xml.rels"].map(parsePart) ?? XMLDocument(xmlString: "<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'/>")
+    let originalTypes = try parsePart(package.parts["[Content_Types].xml"]!)
+    rels.setRootElement(originalRels.rootElement()!.copy() as! XMLElement)
+    content.setRootElement(originalTypes.rootElement()!.copy() as! XMLElement)
+    var output = Set(members), occupied = package.entries, paths: [String: String] = [:]
+    let nonce = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+    func freePath(_ path: String) -> String {
+        if occupied.insert(path).inserted { return path }
+        let parent = (path as NSString).deletingLastPathComponent, name = (path as NSString).lastPathComponent
+        let renamed = parent + "/docxlite-" + nonce + "-" + name
+        occupied.insert(renamed); return renamed
+    }
+    for path in members where path.hasPrefix("word/media/") {
+        let data = try Data(contentsOf: temporary.appendingPathComponent(path))
+        output.remove(path)
+        if let original = package.knownMedia[data] { paths[path] = original }
+        else {
+            let target = freePath(path); paths[path] = target
+            if target != path { try putPart(data, path: target, temporary: temporary) }
+            output.insert(target)
+        }
+    }
+    var styleMap: [String: String] = [:]
+    if output.contains("word/styles.xml") {
+        let generated = try parsePart(Data(contentsOf: temporary.appendingPathComponent("word/styles.xml")))
+        let target = package.relatedPart("styles") ?? freePath("word/styles.xml")
+        let original = try package.parts[target].map(parsePart) ?? XMLDocument(rootElement: wordElement("styles"))
+        let root = original.rootElement()!
+        if root.namespaces?.isEmpty != false { root.addNamespace(XMLNode.namespace(withName: "w", stringValue: wordNamespace) as! XMLNode) }
+        var ids = Set(wordDescendants(root, named: "style").compactMap { xmlValue($0, "styleId") })
+        var existing: [String: String] = [:]
+        for style in wordDescendants(root, named: "style") { if let id = xmlValue(style, "styleId") { existing[entrySignature(style, id: "styleId")] = id } }
+        let additions = wordDescendants(generated.rootElement()!, named: "style")
+        for style in additions {
+            guard let id = xmlValue(style, "styleId") else { continue }
+            let comparison = style.copy() as! XMLElement
+            remapWordValues(comparison, names: ["basedOn", "next", "link", "pStyle", "rStyle"], values: styleMap)
+            if let match = existing[entrySignature(comparison, id: "styleId")] { styleMap[id] = match; continue }
+            var next = id, suffix = 0
+            while ids.contains(next) { suffix += 1; next = "DOCXLite" + id + (suffix == 1 ? "" : String(suffix)) }
+            ids.insert(next); styleMap[id] = next
+        }
+        for style in additions {
+            guard let id = xmlValue(style, "styleId"), let mapped = styleMap[id], !wordDescendants(root, named: "style").contains(where: { xmlValue($0, "styleId") == mapped }) else { continue }
+            let copy = style.copy() as! XMLElement
+            setXML(copy, ["w:styleId": mapped]); copy.removeAttribute(forName: "w:default")
+            remapWordValues(copy, names: ["basedOn", "next", "link", "pStyle", "rStyle"], values: styleMap); root.addChild(copy)
+        }
+        remapWordValues(xml, names: ["pStyle", "rStyle", "tblStyle"], values: styleMap)
+        output.remove("word/styles.xml"); output.insert(target); paths["word/styles.xml"] = target
+        try putPart(original.xmlData, path: target, temporary: temporary)
+    }
+    if output.contains("word/numbering.xml") {
+        let generated = try parsePart(Data(contentsOf: temporary.appendingPathComponent("word/numbering.xml")))
+        let target = package.relatedPart("numbering") ?? freePath("word/numbering.xml")
+        let original = try package.parts[target].map(parsePart) ?? XMLDocument(rootElement: wordElement("numbering"))
+        let root = original.rootElement()!
+        if root.namespaces?.isEmpty != false { root.addNamespace(XMLNode.namespace(withName: "w", stringValue: wordNamespace) as! XMLNode) }
+        remapWordValues(generated, names: ["pStyle", "styleLink", "numStyleLink"], values: styleMap)
+        var abstractMap: [String: String] = [:], numberMap: [String: String] = [:]
+        for (kind, idName) in [("abstractNum", "abstractNumId"), ("num", "numId")] {
+            let oldEntries = wordDescendants(root, named: kind)
+            var next = (oldEntries.compactMap { xmlValue($0, idName).flatMap(Int.init) }.max() ?? 0) + 1
+            var signatures: [String: String] = [:]
+            for entry in oldEntries { if let id = xmlValue(entry, idName) { signatures[entrySignature(entry, id: idName)] = id } }
+            for entry in wordDescendants(generated.rootElement()!, named: kind) {
+                guard let id = xmlValue(entry, idName) else { continue }
+                let copy = entry.copy() as! XMLElement
+                if kind == "num" { remapWordValues(copy, names: ["abstractNumId"], values: abstractMap) }
+                let signature = entrySignature(copy, id: idName)
+                let mapped: String
+                if let match = signatures[signature] { mapped = match }
+                else {
+                    mapped = String(next); next += 1; setXML(copy, ["w:" + idName: mapped])
+                    // CT_Numbering orders every abstract definition before num.
+                    let following = kind == "abstractNum" ? Set(["num", "numIdMacAtCleanup"]) : Set(["numIdMacAtCleanup"])
+                    if let index = root.children?.firstIndex(where: { following.contains($0.localName ?? "") }) { root.insertChild(copy, at: index) }
+                    else { root.addChild(copy) }
+                    signatures[signature] = mapped
+                }
+                if kind == "num" { numberMap[id] = mapped } else { abstractMap[id] = mapped }
+            }
+        }
+        remapWordValues(xml, names: ["numId"], values: numberMap)
+        output.remove("word/numbering.xml"); output.insert(target); paths["word/numbering.xml"] = target
+        try putPart(original.xmlData, path: target, temporary: temporary)
+    }
+    var usedIDs = Set((rels.rootElement()?.children ?? []).compactMap { ($0 as? XMLElement)?.attribute(forName: "Id")?.stringValue })
+    var relationMap: [String: String] = [:]
+    for relation in generatedRelations {
+        let kind = relationshipKind(relation)
+        guard ["image", "hyperlink", "styles", "numbering"].contains(kind), let old = relation.attribute(forName: "Id")?.stringValue, let target = relation.attribute(forName: "Target")?.stringValue else { continue }
+        let external = relation.attribute(forName: "TargetMode")?.stringValue == "External"
+        let mappedTarget = external ? target : documentTarget(paths[partPath(target)] ?? partPath(target))
+        let type = relation.attribute(forName: "Type")?.stringValue
+        let match = (rels.rootElement()?.children ?? []).compactMap { $0 as? XMLElement }.first { current in
+            guard current.attribute(forName: "Type")?.stringValue == type else { return false }
+            if ["styles", "numbering"].contains(kind) { return true }
+            let currentExternal = current.attribute(forName: "TargetMode")?.stringValue == "External"
+            guard currentExternal == external, let currentTarget = current.attribute(forName: "Target")?.stringValue else { return false }
+            return external ? currentTarget == mappedTarget : partPath(currentTarget) == partPath(mappedTarget)
+        }
+        if let existing = match?.attribute(forName: "Id")?.stringValue { relationMap[old] = existing; continue }
+        let id = usedIDs.insert(old).inserted ? old : "docxlite" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        usedIDs.insert(id); relationMap[old] = id
+        let copy = relation.copy() as! XMLElement; setXML(copy, ["Id": id, "Target": mappedTarget]); rels.rootElement()?.addChild(copy)
+    }
+    var stack: [XMLNode] = [xml]
+    while let node = stack.popLast() {
+        if let element = node as? XMLElement { for attribute in element.attributes ?? [] where attribute.uri == relationshipNamespace || attribute.prefix == "r" {
+            if let old = attribute.stringValue, let mapped = relationMap[old] { attribute.stringValue = mapped }
+        } }
+        stack.append(contentsOf: node.children ?? [])
+    }
+    var defaults = Set((content.rootElement()?.children ?? []).compactMap { ($0 as? XMLElement)?.attribute(forName: "Extension")?.stringValue?.lowercased() })
+    var overrides = Set((content.rootElement()?.children ?? []).compactMap { ($0 as? XMLElement)?.attribute(forName: "PartName")?.stringValue })
+    for item in generatedTypes {
+        if item.localName == "Default", let ext = item.attribute(forName: "Extension")?.stringValue, defaults.insert(ext.lowercased()).inserted { content.rootElement()?.addChild(item.copy() as! XMLElement) }
+        if item.localName == "Override", let part = item.attribute(forName: "PartName")?.stringValue {
+            let old = String(part.dropFirst()), mapped = paths[old] ?? old
+            guard output.contains(mapped), overrides.insert("/" + mapped).inserted else { continue }
+            let copy = item.copy() as! XMLElement; setXML(copy, ["PartName": "/" + mapped]); content.rootElement()?.addChild(copy)
+        }
+    }
+    try pruneDeletedAnnotations(package, anchors: anchors, temporary: temporary, output: &output)
+    // ZIP's update operation replaces only the named edited/generated members.
+    // All other original entries, including their local relationship parts, stay.
+    try package.archive.write(to: archive)
+    members = output.sorted()
+}
+
+private func pruneDeletedAnnotations(_ package: DOCXPackage, anchors: RetainedAnchors, temporary: URL, output: inout Set<String>) throws {
+    let removedComments = Set(package.expectedComments.keys).subtracting(anchors.comments)
+    if !removedComments.isEmpty, let path = package.relatedPart("comments"), let data = package.parts[path] {
+        let xml = try parsePart(data), root = xml.rootElement()!
+        var removedParagraphs = Set<String>()
+        for comment in wordDescendants(root, named: "comment") where removedComments.contains(xmlValue(comment, "id") ?? "") {
+            for paragraph in wordDescendants(comment, named: "p") { if let id = xmlValue(paragraph, "paraId") { removedParagraphs.insert(id) } }
+            comment.detach()
+        }
+        try putPart(xml.xmlData, path: path, temporary: temporary); output.insert(path)
+        for kind in ["commentsExtended", "commentsIds", "commentsExtensible"] {
+            guard let extraPath = package.relatedPart(kind), let extraData = package.parts[extraPath] else { continue }
+            let extra = try parsePart(extraData)
+            var changed = false
+            for node in extra.rootElement()?.children ?? [] {
+                guard let element = node as? XMLElement else { continue }
+                if let id = xmlValue(element, "paraId"), removedParagraphs.contains(id) { element.detach(); changed = true }
+                else if let parent = xmlValue(element, "paraIdParent"), removedParagraphs.contains(parent) { element.attributes?.first(where: { $0.localName == "paraIdParent" })?.detach(); changed = true }
+            }
+            if changed { try putPart(extra.xmlData, path: extraPath, temporary: temporary); output.insert(extraPath) }
+        }
+    }
+    for (kind, ids) in [("footnotes", package.originalFootnotes.subtracting(anchors.footnotes)), ("endnotes", package.originalEndnotes.subtracting(anchors.endnotes))] where !ids.isEmpty {
+        guard let path = package.relatedPart(kind), let data = package.parts[path] else { continue }
+        let xml = try parsePart(data)
+        for node in xml.rootElement()?.children ?? [] {
+            guard let element = node as? XMLElement, ids.contains(xmlValue(element, "id") ?? ""), !["separator", "continuationSeparator", "continuationNotice"].contains(xmlValue(element, "type") ?? "") else { continue }
+            element.detach()
+        }
+        try putPart(xml.xmlData, path: path, temporary: temporary); output.insert(path)
+    }
+}
+private func liftAnchor(_ anchor: XMLElement) {
+    while let parent = anchor.parent as? XMLElement, parent.localName != "p", let grand = parent.parent as? XMLElement {
+        let children = parent.children ?? []
+        guard let position = children.firstIndex(where: { $0 === anchor }), let index = (grand.children ?? []).firstIndex(where: { $0 === parent }) else { return }
+        func wrapper(_ values: ArraySlice<XMLNode>) -> XMLElement? {
+            guard !values.isEmpty else { return nil }
+            let copy = XMLElement(name: parent.name ?? "w:hyperlink")
+            for attribute in parent.attributes ?? [] { copy.addAttribute(attribute.copy() as! XMLNode) }
+            for child in values { child.detach(); copy.addChild(child) }; return copy
+        }
+        let before = wrapper(children[..<position]), after = wrapper(children[(position + 1)...])
+        anchor.detach(); parent.detach()
+        var replacement: [XMLNode] = []
+        if let before { replacement.append(before) }; replacement.append(anchor); if let after { replacement.append(after) }
+        for (offset, node) in replacement.enumerated() { grand.insertChild(node, at: index + offset) }
+    }
+}
+private func writeRetainedAnchors(_ anchors: RetainedAnchors, package: DOCXPackage?, index: ExportXMLIndex, xml: XMLDocument) throws {
+    for record in anchors.kept {
+        guard let run = index.anchors[record.marker], let paragraph = ancestor(run, named: "p") else { throw structureError() }
+        let original = try XMLElement(xmlString: String(decoding: record.anchor.xml, as: UTF8.self))
+        if record.anchor.kind == "sectPr" {
+            let properties = xmlChild("pPr", of: paragraph, first: true)
+            for child in properties.children ?? [] where child.localName == "sectPr" { child.detach() }
+            properties.addChild(original); run.detach()
+        } else if record.anchor.visible {
+            var children: [XMLNode] = []
+            if let properties = record.anchor.properties { children.append(try XMLElement(xmlString: String(decoding: properties, as: UTF8.self))) }
+            else if record.anchor.kind != "commentReference" { let props = wordElement("rPr"); props.addChild(wordElement("vertAlign", ["w:val": "superscript"])); children.append(props) }
+            children.append(original); replaceXMLChildren(run, with: children)
+        } else {
+            liftAnchor(run)
+            if let parent = run.parent as? XMLElement, let position = (parent.children ?? []).firstIndex(where: { $0 === run }) { run.detach(); parent.insertChild(original, at: position) }
+        }
+    }
+    if let section = package?.finalSection, let body = xml.rootElement()?.children?.first(where: { $0.localName == "body" }) as? XMLElement {
+        for child in body.children ?? [] where child.localName == "sectPr" { child.detach() }
+        body.addChild(try XMLElement(xmlString: String(decoding: section, as: UTF8.self)))
+    }
+}
+
 // UI fonts have private PostScript names. They are never valid document families.
 func documentFont(_ font: NSFont) -> NSFont {
     guard font.fontName.hasPrefix(".") || (font.familyName?.hasPrefix(".") ?? false) else { return font }
@@ -30,7 +535,7 @@ private func normalizeDocumentFonts(_ text: NSMutableAttributedString) {
 // their document values rather than NSObject identities or transient layout data.
 private func documentState(_ text: NSAttributedString) -> NSAttributedString {
     let result = NSMutableAttributedString(attributedString: text)
-    let keys: Set<NSAttributedString.Key> = [.font, .foregroundColor, .backgroundColor, .paragraphStyle, .underlineStyle, .strikethroughStyle, .link, .attachment, .kern, .baselineOffset, wordParagraphStyleKey]
+    let keys: Set<NSAttributedString.Key> = [.font, .foregroundColor, .backgroundColor, .paragraphStyle, .underlineStyle, .strikethroughStyle, .link, .attachment, .kern, .baselineOffset, wordParagraphStyleKey, docxAnchorKey]
     var tables: [ObjectIdentifier: Int] = [:]
     text.enumerateAttributes(in: NSRange(location: 0, length: text.length)) { values, range, _ in
         var attributes = values.filter { keys.contains($0.key) }
@@ -86,7 +591,17 @@ private func exportParagraphs(_ text: NSAttributedString) -> [ExportParagraph] {
     return paragraphs
 }
 private func setXML(_ element: XMLElement, _ attributes: [String: String]) {
-    for (key, value) in attributes { element.addAttribute(XMLNode.attribute(withName: key, stringValue: value) as! XMLNode) }
+    for (key, value) in attributes {
+        let pieces = key.split(separator: ":"), local = String(pieces.last!)
+        let prefix = pieces.count > 1 ? String(pieces[0]) : ""
+        let uri = prefix == "w" ? wordNamespace : prefix == "r" ? relationshipNamespace : ""
+        // Parsed attributes carry namespace URIs; newly built attributes may
+        // carry only a prefix. addAttribute alone can duplicate the parsed one.
+        if let existing = element.attributes?.first(where: {
+            $0.name == key || ($0.localName == local && (($0.prefix ?? "") == prefix || (!uri.isEmpty && $0.uri == uri)))
+        }) { existing.stringValue = value }
+        else { element.addAttribute(XMLNode.attribute(withName: key, stringValue: value) as! XMLNode) }
+    }
 }
 private func wordElement(_ name: String, _ attributes: [String: String] = [:]) -> XMLElement {
     let element = XMLElement(name: "w:" + name); setXML(element, attributes); return element
@@ -295,9 +810,9 @@ private func canonicalHeading(_ value: String) -> String? {
     let key = value.lowercased().replacingOccurrences(of: " ", with: "")
     return wordStyleIDs.first { $0.lowercased() == key }
 }
-private func prepareParagraphs(_ url: URL, xml: XMLDocument, prefix: String) throws -> [EmbeddedParagraph] {
+private func prepareParagraphs(_ url: URL, xml: XMLDocument, prefix: String, package: DOCXPackage?) throws -> [EmbeddedParagraph] {
     var styleIDs: [String: String] = [:]
-    if let data = try? archiveMember(url, "word/styles.xml"), let styles = try? XMLDocument(data: data, options: [.nodeLoadExternalEntitiesNever]) {
+    if let data = try? archiveMember(url, package?.relatedPart("styles") ?? "word/styles.xml"), let styles = try? XMLDocument(data: data, options: [.nodeLoadExternalEntitiesNever]) {
         for case let style as XMLElement in try styles.nodes(forXPath: "//*[local-name()='style']") {
             guard let id = xmlValue(style, "styleId") else { continue }
             let name = try style.nodes(forXPath: "./*[local-name()='name']").first as? XMLElement
@@ -305,7 +820,7 @@ private func prepareParagraphs(_ url: URL, xml: XMLDocument, prefix: String) thr
         }
     }
     var definitions: [String: [Int: (String, Int)]] = [:], numbers: [String: String] = [:]
-    if let data = try? archiveMember(url, "word/numbering.xml"), let numbering = try? XMLDocument(data: data, options: [.nodeLoadExternalEntitiesNever]) {
+    if let data = try? archiveMember(url, package?.relatedPart("numbering") ?? "word/numbering.xml"), let numbering = try? XMLDocument(data: data, options: [.nodeLoadExternalEntitiesNever]) {
         for case let abstract as XMLElement in try numbering.nodes(forXPath: "//*[local-name()='abstractNum']") {
             guard let id = xmlValue(abstract, "abstractNumId") else { continue }
             for case let level as XMLElement in try abstract.nodes(forXPath: "./*[local-name()='lvl']") {
@@ -412,8 +927,9 @@ func archiveMember(_ archive: URL, _ member: String) throws -> Data {
 // AppKit's DOCX importer omits DrawingML pictures. Insert unique text anchors in a
 // temporary copy, then replace them with native attachments after importing styles.
 // The original archive is never written to or extracted to the filesystem.
-private func preparePictures(_ url: URL, in temporary: URL) throws -> (URL, [EmbeddedPicture], [EmbeddedLink], [EmbeddedStyle], [EmbeddedParagraph]) {
+private func preparePictures(_ url: URL, in temporary: URL, package: DOCXPackage?) throws -> (URL, [EmbeddedPicture], [EmbeddedLink], [EmbeddedStyle], [EmbeddedParagraph], [ImportedAnchor]) {
     let xml = try XMLDocument(data: archiveMember(url, "word/document.xml"), options: [.nodePreserveWhitespace, .nodeLoadExternalEntitiesNever])
+    let retained = try prepareRetainedAnchors(xml, package: package)
     let drawings = try xml.nodes(forXPath: "//*[local-name()='drawing' or local-name()='pict']")
     let hyperlinks = try xml.nodes(forXPath: "//*[local-name()='hyperlink']")
     let runs = try xml.nodes(forXPath: "//*[local-name()='r']")
@@ -438,6 +954,7 @@ private func preparePictures(_ url: URL, in temporary: URL) throws -> (URL, [Emb
         guard let reference = try drawing.nodes(forXPath: ".//*[local-name()='blip']/@*[local-name()='embed'] | .//*[local-name()='imagedata']/@*[local-name()='id']").first?.stringValue,
               let target = targets[reference], let data = try? archiveMember(url, target),
               let image = NSImage(data: data), let parent = drawing.parent as? XMLElement else { continue }
+        package?.recordMedia(data, path: target)
         var size = image.size
         if let extent = try drawing.nodes(forXPath: ".//*[local-name()='extent' and @cx and @cy]").first as? XMLElement,
            let width = Double(extent.attribute(forName: "cx")?.stringValue ?? ""),
@@ -483,8 +1000,8 @@ private func preparePictures(_ url: URL, in temporary: URL) throws -> (URL, [Emb
         run.addChild(XMLElement(name: "w:t", stringValue: end))
         styles.append(EmbeddedStyle(start: start, end: end, color: color, lineMultiple: multiple))
     }
-    let paragraphs = try prepareParagraphs(url, xml: xml, prefix: prefix)
-    guard !pictures.isEmpty || !links.isEmpty || !styles.isEmpty || !paragraphs.isEmpty else { return (url, [], [], [], []) }
+    let paragraphs = try prepareParagraphs(url, xml: xml, prefix: prefix, package: package)
+    guard !pictures.isEmpty || !links.isEmpty || !styles.isEmpty || !paragraphs.isEmpty || !retained.isEmpty || package?.finalSection != nil else { return (url, [], [], [], [], []) }
     try FileManager.default.createDirectory(at: temporary.appendingPathComponent("word"), withIntermediateDirectories: true)
     let copy = temporary.appendingPathComponent("document.docx")
     try FileManager.default.copyItem(at: url, to: copy)
@@ -498,16 +1015,18 @@ private func preparePictures(_ url: URL, in temporary: URL) throws -> (URL, [Emb
     let finished = try startProcess(zip)
     finished.wait()
     guard zip.terminationStatus == 0 else { throw NSError(domain: "LettoreDOCX", code: 3) }
-    return (copy, pictures, links, styles, paragraphs)
+    return (copy, pictures, links, styles, paragraphs, retained)
 }
 
 struct WordDocument {
+    let package: DOCXPackage?
     let text: NSAttributedString
     let pageSize: NSSize
     let margin: CGFloat
     let wordCount: Int
 
     init(text: NSAttributedString) {
+        self.package = packageInText(text)
         self.text = text; pageSize = NSSize(width: 595, height: 842); margin = 56; wordCount = 0
     }
 
@@ -518,19 +1037,20 @@ struct WordDocument {
                 NSLocalizedDescriptionKey: L("Scegli un documento .docx, .doc, .odt o .rtf.", "Choose a .docx, .doc, .odt or .rtf document.")
             ])
         }
+        package = ext == "docx" ? try DOCXPackage(url: url) : nil
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("lettoredocx-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: temporary) }
         // DOCX gets the picture/link pass; .doc, .odt and .rtf use the native importers as they are.
-        let (importURL, pictures, links, styles, paragraphs) = ext == "docx" ? try preparePictures(url, in: temporary) : (url, [], [], [], [])
+        let (importURL, pictures, links, styles, paragraphs, retained) = ext == "docx" ? try preparePictures(url, in: temporary, package: package) : (url, [], [], [], [], [])
         let types: [String: NSAttributedString.DocumentType] = ["docx": .officeOpenXML, "doc": .docFormat, "odt": .openDocument, "rtf": .rtf]
         var attributes: NSDictionary?
         let imported = try NSMutableAttributedString(url: importURL, options: [
             .documentType: types[ext] ?? .officeOpenXML
         ], documentAttributes: &attributes)
         let metadata = attributes as? [NSAttributedString.DocumentAttributeKey: Any] ?? [:]
-        let size = (metadata[.paperSize] as? NSValue)?.sizeValue ?? NSSize(width: 595, height: 842)
+        let size = package?.sectionSize ?? (metadata[.paperSize] as? NSValue)?.sizeValue ?? NSSize(width: 595, height: 842)
         pageSize = NSSize(width: min(2400, max(300, size.width)), height: min(3600, max(400, size.height)))
-        margin = min(pageSize.width / 4, max(24, (metadata[.leftMargin] as? NSNumber)?.doubleValue ?? 56))
+        margin = min(pageSize.width / 4, max(24, package?.leftMargin ?? (metadata[.leftMargin] as? NSNumber)?.doubleValue ?? 56))
         for picture in pictures {
             let range = (imported.string as NSString).range(of: picture.marker)
             guard range.location != NSNotFound, let image = NSImage(data: picture.data) else { continue }
@@ -593,10 +1113,12 @@ struct WordDocument {
             style.textLists = [NSTextList(markerFormat: numbered ? NSTextList.MarkerFormat(rawValue: "{decimal}.") : .disc, options: 0)]
             imported.addAttribute(.paragraphStyle, value: style, range: source.paragraphRange(for: range))
         }
+        restoreRetainedAnchors(retained, in: imported, package: package)
         normalizeDocumentFonts(imported)
         text = imported
         var count = 0
-        text.string.enumerateSubstrings(in: text.string.startIndex..<text.string.endIndex, options: .byWords) { _, _, _, _ in
+        let plain = documentPlainText(text)
+        plain.enumerateSubstrings(in: plain.startIndex..<plain.endIndex, options: .byWords) { _, _, _, _ in
             count += 1
         }
         wordCount = count
@@ -642,6 +1164,27 @@ final class ReaderTextView: NSTextView {
         super.mouseDown(with: event)
         isSelectingWithMouse = false
         selectionFinished?()
+    }
+    override func insertText(_ insertString: Any, replacementRange: NSRange) {
+        if typingAttributes[docxAnchorKey] != nil {
+            var attrs = typingAttributes
+            for key in [docxAnchorKey, .toolTip, .baselineOffset, .attachment] { attrs.removeValue(forKey: key) }
+            let source = textStorage
+            let point = min(selectedRange().location, max(0, (source?.length ?? 0) - 1))
+            var inherited: [NSAttributedString.Key: Any]?
+            if let source, source.length > 0 {
+                for distance in 0..<source.length {
+                    for position in [point - distance, point + distance] where position >= 0 && position < source.length {
+                        if source.attribute(docxAnchorKey, at: position, effectiveRange: nil) == nil { inherited = source.attributes(at: position, effectiveRange: nil); break }
+                    }
+                    if inherited != nil { break }
+                }
+            }
+            attrs[.font] = inherited?[.font] ?? NSFont(name: "Arial", size: 12)!
+            attrs[.foregroundColor] = inherited?[.foregroundColor] ?? NSColor.black
+            typingAttributes = attrs
+        }
+        super.insertText(insertString, replacementRange: replacementRange)
     }
     override func cancelOperation(_ sender: Any?) {
         if cancelPendingAction?() != true { super.cancelOperation(sender) }
@@ -697,6 +1240,9 @@ final class ReaderApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSear
     let styleNames = [L("Testo normale", "Normal text"), L("Titolo", "Title"), L("Intestazione 1", "Heading 1"), L("Intestazione 2", "Heading 2"), L("Intestazione 3", "Heading 3")]
     let styleSizes: [CGFloat] = [12, 30, 24, 20, 16]
     var document: WordDocument?
+    private var currentPackage: DOCXPackage?
+    let headerPreview = NSTextField(labelWithString: "")
+    let footerPreview = NSTextField(labelWithString: "")
     var currentURL: URL?
     var pendingURL: URL?
     var matches: [NSRange] = []
@@ -862,6 +1408,12 @@ final class ReaderApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSear
         textView.unregisterDraggedTypes()
         textView.setAccessibilityLabel(L("Contenuto del documento", "Document content"))
         canvas.addSubview(textView)
+        for (field, label) in [(headerPreview, L("Intestazione, sola lettura", "Header, read only")), (footerPreview, L("Piè di pagina, sola lettura", "Footer, read only"))] {
+            field.font = .systemFont(ofSize: 10); field.textColor = .secondaryLabelColor
+            field.appearance = NSAppearance(named: .aqua); field.drawsBackground = true; field.backgroundColor = .white
+            field.lineBreakMode = .byTruncatingTail; field.maximumNumberOfLines = 1
+            field.setAccessibilityLabel(label); field.isHidden = true; canvas.addSubview(field)
+        }
         textView.isHidden = true
 
         status.font = .systemFont(ofSize: 11)
@@ -933,6 +1485,8 @@ final class ReaderApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSear
         let size = NSSize(width: max(viewport.width, pageWidth + 48), height: max(viewport.height, paperHeight + 48))
         if canvas.frame.size != size { canvas.setFrameSize(size) }
         textView.frame = NSRect(x: floor((size.width - pageWidth) / 2), y: 24, width: pageWidth, height: paperHeight)
+        headerPreview.frame = NSRect(x: textView.frame.minX + margin, y: 31, width: pageWidth - margin * 2, height: 15)
+        footerPreview.frame = NSRect(x: textView.frame.minX + margin, y: textView.frame.maxY - 22, width: pageWidth - margin * 2, height: 15)
     }
 
     @objc func openFile() {
@@ -1002,14 +1556,20 @@ final class ReaderApp: NSObject, NSApplicationDelegate, NSWindowDelegate, NSSear
         documentGeneration = UUID(); closeApproved = false
         paintAttributes = nil
         self.document = document
+        currentPackage = document.package
+        headerPreview.stringValue = document.package?.headerText ?? ""; headerPreview.toolTip = document.package?.headerDetails
+        footerPreview.stringValue = document.package?.footerText ?? ""; footerPreview.toolTip = document.package?.footerDetails
+        headerPreview.isHidden = headerPreview.stringValue.isEmpty; footerPreview.isHidden = footerPreview.stringValue.isEmpty
         currentURL = url
-        needsRewriteWarning = url?.pathExtension.lowercased() == "docx"
+        needsRewriteWarning = !(document.package?.unsupported.isEmpty ?? true)
         margin = document.margin
         pageWidth = document.pageSize.width
         pageHeight = document.pageSize.height
         textView.textContainerInset = NSSize(width: document.margin, height: document.margin)
         textView.textContainer?.containerSize = NSSize(width: pageWidth - document.margin * 2, height: .greatestFiniteMagnitude)
-        textView.textStorage?.setAttributedString(document.text)
+        let body = NSMutableAttributedString(attributedString: document.text)
+        body.removeAttribute(docxPackageKey, range: NSRange(location: 0, length: body.length))
+        textView.textStorage?.setAttributedString(body)
         if let manager = textView.layoutManager, let container = textView.textContainer {
             manager.ensureLayout(for: container)
             paperHeight = max(pageHeight, ceil(manager.usedRect(for: container).maxY) + document.margin * 2)
@@ -1214,20 +1774,21 @@ private func imagePayload(_ attachment: NSTextAttachment, cache: inout [ObjectId
 
 // A single forward pass builds the native writer input. Attribute runs, image
 // substitutions and boundary events are consumed in source UTF-16 coordinates.
-private func prepareExport(_ text: NSAttributedString, paragraphs: [ExportParagraph], pictures: [ExportPicture], annotations: [ExportAnnotation]) -> NSAttributedString {
+private func prepareExport(_ text: NSAttributedString, paragraphs: [ExportParagraph], pictures: [ExportPicture], annotations: [ExportAnnotation], retained: RetainedAnchors) -> NSAttributedString {
     var events: [Int: [String]] = [:]
     for annotation in annotations {
         events[annotation.range.location, default: []].append(annotation.start)
         events[NSMaxRange(annotation.range), default: []].append(annotation.end)
     }
     for paragraph in paragraphs { events[paragraph.range.location, default: []].append(paragraph.marker) }
+    for anchor in retained.kept { events[anchor.position, default: []].append(anchor.marker) }
     var runs: [(NSRange, [NSAttributedString.Key: Any])] = []
     var styles: [ObjectIdentifier: NSParagraphStyle] = [:]
     var boundaries = Set(events.keys)
     boundaries.insert(0); boundaries.insert(text.length)
     text.enumerateAttributes(in: NSRange(location: 0, length: text.length)) { values, range, _ in
         var attrs = values
-        attrs.removeValue(forKey: .attachment)
+        for key in [NSAttributedString.Key.attachment, docxAnchorKey, docxPackageKey, .toolTip] { attrs.removeValue(forKey: key) }
         if let font = attrs[.font] as? NSFont { attrs[.font] = documentFont(font) }
         if let paragraph = attrs[.paragraphStyle] as? NSParagraphStyle {
             let id = ObjectIdentifier(paragraph)
@@ -1240,6 +1801,7 @@ private func prepareExport(_ text: NSAttributedString, paragraphs: [ExportParagr
         runs.append((range, attrs)); boundaries.insert(range.location); boundaries.insert(NSMaxRange(range))
     }
     for picture in pictures { boundaries.insert(picture.range.location); boundaries.insert(NSMaxRange(picture.range)) }
+    for position in retained.positions { boundaries.insert(position); boundaries.insert(position + 1) }
     let positions = boundaries.sorted(), source = text.string as NSString
     let output = NSMutableAttributedString(string: "")
     let markerFont = NSFont(name: "Arial", size: 1)!
@@ -1251,6 +1813,7 @@ private func prepareExport(_ text: NSAttributedString, paragraphs: [ExportParagr
         if let markers = events[position] {
             var markerAttributes = attributes
             markerAttributes[.font] = markerFont
+            markerAttributes[.foregroundColor] = NSColor.black
             markerAttributes.removeValue(forKey: .link); markerAttributes.removeValue(forKey: .backgroundColor)
             output.append(NSAttributedString(string: markers.joined(), attributes: markerAttributes))
         }
@@ -1259,7 +1822,7 @@ private func prepareExport(_ text: NSAttributedString, paragraphs: [ExportParagr
             output.append(NSAttributedString(string: pictures[picture].marker, attributes: attributes))
         }
         guard index + 1 < positions.count else { continue }
-        if picture < pictures.count && NSLocationInRange(position, pictures[picture].range) { continue }
+        if retained.positions.contains(position) || (picture < pictures.count && NSLocationInRange(position, pictures[picture].range)) { continue }
         let range = NSRange(location: position, length: positions[index + 1] - position)
         if range.length > 0 { output.append(NSAttributedString(string: source.substring(with: range), attributes: attributes)) }
     }
@@ -1280,7 +1843,7 @@ private final class ExportXMLIndex {
     var runPositions: [ObjectIdentifier: Int] = [:]
     var paragraphPositions: [ObjectIdentifier: Int] = [:]
     init(_ xml: XMLDocument, tokens: Set<String>) throws {
-        let pattern = try NSRegularExpression(pattern: "DOCXLITE(?:PARA|IMAGE|FORMAT)[A-F0-9]{32}(?:START|END)?")
+        let pattern = try NSRegularExpression(pattern: "DOCXLITE(?:PARA|IMAGE|FORMAT|KEEP)[A-F0-9]{32}(?:START|END)?")
         var replacements: [ObjectIdentifier: [XMLNode]] = [:]
         var parents: [ObjectIdentifier: (XMLElement, [XMLNode])] = [:]
         for case let original as XMLElement in try xml.nodes(forXPath: "//*[local-name()='r']") {
@@ -1405,7 +1968,9 @@ final class DOCXSaveProfile {
 
 // AppKit exports text/styles. DrawingML anchors keep native attachments portable
 // even on macOS versions whose Office Open XML writer silently omits pictures.
-func writeDOCX(_ text: NSAttributedString, to destination: URL, pageSize: NSSize, margin: CGFloat, profile: DOCXSaveProfile? = nil) throws {
+func writeDOCX(_ text: NSAttributedString, to destination: URL, pageSize: NSSize, margin: CGFloat, profile: DOCXSaveProfile? = nil, package explicitPackage: DOCXPackage? = nil) throws {
+    let package = explicitPackage ?? packageInText(text)
+    let retained = retainedAnchors(in: text, package: package)
     let paragraphs = exportParagraphs(text).filter { !$0.style.textBlocks.isEmpty || !$0.style.textLists.isEmpty || ($0.heading != nil && $0.heading != "Normal") }
     profile?.mark("paragraphs")
     let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("docxlite-export-" + UUID().uuidString)
@@ -1414,13 +1979,13 @@ func writeDOCX(_ text: NSAttributedString, to destination: URL, pageSize: NSSize
     var pictures: [ExportPicture] = [], imageCache: [ObjectIdentifier: (Data, String, String)] = [:]
     let source = text.string as NSString
     text.enumerateAttribute(.attachment, in: NSRange(location: 0, length: text.length)) { value, range, _ in
-        guard let attachment = value as? NSTextAttachment, let payload = imagePayload(attachment, cache: &imageCache) else { return }
+        guard let attachment = value as? NSTextAttachment, text.attribute(docxAnchorKey, at: range.location, effectiveRange: nil) == nil, let payload = imagePayload(attachment, cache: &imageCache) else { return }
         let image = (attachment.attachmentCell as? NSTextAttachmentCell)?.image
         for position in range.location..<NSMaxRange(range) where source.character(at: position) == 0xfffc {
             pictures.append(ExportPicture(range: NSRange(location: position, length: 1), marker: "DOCXLITEIMAGE" + UUID().uuidString.replacingOccurrences(of: "-", with: ""), data: payload.0, size: image?.size ?? NSSize(width: 100, height: 100), suffix: payload.1, contentType: payload.2))
         }
     }
-    guard pictures.count == text.string.utf16.filter({ $0 == 0xfffc }).count else {
+    guard pictures.count == text.string.utf16.enumerated().filter({ $0.element == 0xfffc && !retained.positions.contains($0.offset) }).count else {
         throw NSError(domain: appName, code: 4, userInfo: [NSLocalizedDescriptionKey: L("Un'immagine non può essere esportata. Il file non è stato salvato.", "An image could not be exported. The file was not saved.")])
     }
     var annotations: [ExportAnnotation] = []
@@ -1432,14 +1997,14 @@ func writeDOCX(_ text: NSAttributedString, to destination: URL, pageSize: NSSize
         let token = "DOCXLITEFORMAT" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
         annotations.append(ExportAnnotation(range: range, start: token + "START", end: token + "END", link: link, color: color, multiple: multiple))
     }
-    let export = prepareExport(text, paragraphs: paragraphs, pictures: pictures, annotations: annotations)
+    let export = prepareExport(text, paragraphs: paragraphs, pictures: pictures, annotations: annotations, retained: retained)
     profile?.mark("prepare")
     let data = try export.data(from: NSRange(location: 0, length: export.length), documentAttributes: [
         .documentType: NSAttributedString.DocumentType.officeOpenXML, .paperSize: NSValue(size: pageSize),
         .leftMargin: margin, .rightMargin: margin, .topMargin: margin, .bottomMargin: margin
     ])
     profile?.mark("AppKit writer")
-    if pictures.isEmpty && annotations.isEmpty && paragraphs.isEmpty {
+    if package == nil && pictures.isEmpty && annotations.isEmpty && paragraphs.isEmpty && retained.kept.isEmpty {
         try data.write(to: destination, options: .atomic); profile?.mark("package write"); return
     }
     let archive = temporary.appendingPathComponent("document.docx")
@@ -1452,7 +2017,7 @@ func writeDOCX(_ text: NSAttributedString, to destination: URL, pageSize: NSSize
     try FileManager.default.createDirectory(at: media, withIntermediateDirectories: true)
     try FileManager.default.createDirectory(at: temporary.appendingPathComponent("word/_rels"), withIntermediateDirectories: true)
     var members = ["word/document.xml", "word/_rels/document.xml.rels", "[Content_Types].xml"]
-    let tokens = Set(paragraphs.map { $0.marker } + pictures.map { $0.marker } + annotations.flatMap { [$0.start, $0.end] })
+    let tokens = Set(paragraphs.map { $0.marker } + pictures.map { $0.marker } + annotations.flatMap { [$0.start, $0.end] } + retained.kept.map { $0.marker })
     profile?.mark("package read")
     let index = try ExportXMLIndex(xml, tokens: tokens)
     profile?.mark("XML index")
@@ -1467,8 +2032,9 @@ func writeDOCX(_ text: NSAttributedString, to destination: URL, pageSize: NSSize
         }
         rels.rootElement()?.addChild(relationship)
         let cx = Int(max(1, picture.size.width) * 12700), cy = Int(max(1, picture.size.height) * 12700)
+        let drawingID = (package?.nextDrawingID ?? 1) + imageIndex
         let drawing = try XMLElement(xmlString: """
-        <w:drawing xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><wp:inline><wp:extent cx="\(cx)" cy="\(cy)"/><wp:docPr id="\(imageIndex + 1)" name="Image \(imageIndex + 1)"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPr id="\(imageIndex + 1)" name="\(filename)"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="\(id)"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="\(cx)" cy="\(cy)"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing>
+        <w:drawing xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><wp:inline><wp:extent cx="\(cx)" cy="\(cy)"/><wp:docPr id="\(drawingID)" name="Image \(imageIndex + 1)"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPr id="\(imageIndex + 1)" name="\(filename)"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="\(id)"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="\(cx)" cy="\(cy)"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing>
         """)
         guard let anchor = index.anchors[picture.marker] else { throw structureError() }
         replaceXMLChildren(anchor, with: (anchor.children ?? []).filter { $0.localName == "rPr" } + [drawing])
@@ -1516,6 +2082,8 @@ func writeDOCX(_ text: NSAttributedString, to destination: URL, pageSize: NSSize
     }
     profile?.mark("annotations")
     try writeStructures(paragraphs, xml: xml, rels: rels, content: content, temporary: temporary, members: &members, width: pageSize.width - margin * 2, index: index, profile: profile)
+    if let package { try mergeRetainedPackage(package, xml: xml, rels: rels, content: content, temporary: temporary, archive: archive, members: &members, anchors: retained) }
+    try writeRetainedAnchors(retained, package: package, index: index, xml: xml)
     profile?.mark("structures")
     try orderParagraphProperties(xml)
     try xml.xmlData.write(to: temporary.appendingPathComponent("word/document.xml"))
@@ -1670,7 +2238,10 @@ extension ReaderApp {
     }
     @objc func saveDocument() { save(interactiveAs: false) }
     @objc func saveAs() { save(interactiveAs: true) }
-    var rewriteWarningText: String { L("AppKit riscrive il file e può perdere intestazioni e piè di pagina, note a piè di pagina, commenti, revisioni, tabelle complesse e impaginazioni complesse.", "AppKit rewrites the file and may drop headers/footers, footnotes, comments, tracked changes, complex tables and complex layout.") }
+    var rewriteWarningText: String {
+        let issues = currentPackage?.unsupported ?? []
+        return L("Questi elementi potrebbero non essere conservati durante il salvataggio:", "These elements may not be preserved when saving:") + "\n" + issues.map { "• " + $0 }.joined(separator: "\n")
+    }
     func save(interactiveAs: Bool, completion: ((Bool) -> Void)? = nil) {
         guard !isSaving else { completion?(false); return }
         var choose = interactiveAs || currentURL?.pathExtension.lowercased() != "docx"
@@ -1722,11 +2293,11 @@ extension ReaderApp {
         }
         textView.breakUndoCoalescing()
         let snapshot = saveSnapshot(textView.attributedString()), generation = documentGeneration
-        let size = NSSize(width: pageWidth, height: pageHeight), inset = margin
+        let size = NSSize(width: pageWidth, height: pageHeight), inset = margin, package = currentPackage
         isSaving = true; saveProgress.startAnimation(nil); updateStatus()
         saver.async { [weak self] in
             let onMain = Thread.isMainThread
-            let result: Result<Void, Error> = autoreleasepool { Result { try writeDOCX(snapshot, to: url, pageSize: size, margin: inset) } }
+            let result: Result<Void, Error> = autoreleasepool { Result { try writeDOCX(snapshot, to: url, pageSize: size, margin: inset, package: package) } }
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.lastSaveWasOnMainThread = onMain
@@ -1745,7 +2316,7 @@ extension ReaderApp {
     // Synchronous model seam for round-trip tests; UI actions always use the queue.
     func writeDocument(to url: URL) throws {
         let snapshot = saveSnapshot(textView.attributedString())
-        try writeDOCX(snapshot, to: url, pageSize: NSSize(width: pageWidth, height: pageHeight), margin: margin)
+        try writeDOCX(snapshot, to: url, pageSize: NSSize(width: pageWidth, height: pageHeight), margin: margin, package: currentPackage)
         finishSave(snapshot, to: url)
     }
     #endif
@@ -1843,6 +2414,7 @@ extension ReaderApp {
             textView.textStorage?.enumerateAttributes(in: range) { attributes, run, _ in
                 var clean = defaultAttributes
                 if let attachment = attributes[.attachment] { clean[.attachment] = attachment }
+                for key in [docxAnchorKey, docxPackageKey, .toolTip, .baselineOffset] { if let value = attributes[key] { clean[key] = value } }
                 if let old = attributes[.paragraphStyle] as? NSParagraphStyle {
                     let style = NSMutableParagraphStyle(); style.textBlocks = old.textBlocks; style.textLists = old.textLists
                     clean[.paragraphStyle] = style
@@ -2197,9 +2769,10 @@ extension ReaderApp {
         zoomPopup.selectItem(at: 0)
     }
     func documentCounts() -> (words: Int, characters: Int) {
+        let plain = documentPlainText(textView.attributedString())
         var words = 0
-        textView.string.enumerateSubstrings(in: textView.string.startIndex..<textView.string.endIndex, options: .byWords) { _, _, _, _ in words += 1 }
-        return (words, textView.string.count)
+        plain.enumerateSubstrings(in: plain.startIndex..<plain.endIndex, options: .byWords) { _, _, _, _ in words += 1 }
+        return (words, plain.count)
     }
     @objc func countDialog() {
         let counts = documentCounts(), alert = NSAlert()

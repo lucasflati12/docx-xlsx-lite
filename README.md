@@ -1,11 +1,11 @@
 # DOCX Lite & XLSX Lite
 
-Two tiny native macOS apps to open and edit Word and Excel files without installing a full office suite. Native Swift, no dependencies, under 2 MB per app, universal (Apple Silicon + Intel).
+Two tiny native macOS apps to open and edit Word and Excel files without installing a full office suite. Native Swift, no dependencies, about 2 MB per app, universal (Apple Silicon + Intel).
 
 | | App | What it does |
 |---|---|---|
-| <img src="docx-lite/icon.png" width="64"> | [**DOCX Lite**](docx-lite/) | A small Google-Docs-style editor for `.docx` (also opens `.doc`, `.odt`, `.rtf`): styles (Normal text, Title, Headings), fonts and sizes, bold/italic/underline, text and highlight color, links, images, alignment, line spacing, bulleted / numbered lists and checklists, indent, paint format, clear formatting, find & replace, spell check, word count, print and export to PDF. Saves real Word tables, lists, headings and images. |
-| <img src="xlsx-lite/icon.png" width="64"> | [**XLSX Lite**](xlsx-lite/) | A small Google-Sheets-style editor for `.xlsx` / `.xlsm`: name box and formula bar, typing straight into cells, range selection with sum / average / count, copy & paste with Excel / Numbers / Sheets, sort, filters, fill handle and fill down, number formats (€, %, decimals, dates), bold / italic / strikethrough, text and fill color, alignment, wrap, Σ quick functions, freeze first row, ~70 formulas. Opens a 20,000-row sheet in about 2 seconds. |
+| <img src="docx-lite/icon.png" width="64"> | [**DOCX Lite**](docx-lite/) | A small Google-Docs-style editor for `.docx` (also opens `.doc`, `.odt`, `.rtf`): styles (Normal text, Title, Headings), fonts and sizes, bold/italic/underline, text and highlight color, links, images, alignment, line spacing, bulleted / numbered lists and checklists, indent, paint format, clear formatting, find & replace, spell check, word count, print and export to PDF. Saves real Word tables, lists, headings and images, and keeps headers, footers, comments, footnotes and page settings of Word files. |
+| <img src="xlsx-lite/icon.png" width="64"> | [**XLSX Lite**](xlsx-lite/) | A small Google-Sheets-style editor for `.xlsx` / `.xlsm`: name box and formula bar, typing straight into cells, range selection with sum / average / count, copy & paste with Excel / Numbers / Sheets, insert / delete rows and columns (every formula, range and chart reference moves like in Excel), charts (shows Excel charts and creates column, bar, line and pie charts), sort, filters, fill handle and fill down, number formats (€, %, decimals, dates), bold / italic / strikethrough, text and fill color, alignment, wrap, Σ quick functions, freeze first row, ~70 formulas. Opens a 20,000-row sheet in about 2 seconds. |
 
 The interface follows your Mac's language: Italian or English.
 
@@ -54,8 +54,8 @@ Pass a path to build somewhere else, e.g. `bash docx-lite/build.sh "/Application
 
 ## Limits
 
-- DOCX Lite is not Word: headers/footers, footnotes, comments, tracked changes and complex layouts are not edited, and saving a Word file with them may drop them. The app warns you the first time and offers Save a Copy.
-- XLSX Lite does not insert/delete rows or columns, draw charts or run macros. Pasted formulas are not re-referenced, and sorting is refused on ranges that contain formulas or merged cells.
+- DOCX Lite does not edit headers/footers, comments or footnotes (it shows and keeps them). Tracked changes, text boxes, shapes, SmartArt, equations and embedded objects may be lost when saving: if a file has them, the app lists them and offers Save a Copy.
+- XLSX Lite does not run macros or pivot tables. Inserting/deleting rows and columns is refused on sheets with things it cannot move safely (pivot tables, external links, some Excel extensions), so formulas are never silently broken. Pasted formulas are not re-referenced, and sorting is refused on ranges with formulas or merged cells.
 - Very large sheets show the first ~400,000 cells. Password-protected files are not supported.
 
 ## Tests

@@ -418,8 +418,150 @@ func runSheetModelTests(_ fixture: URL) {
         checks.date1904 = true
         sheetCheck(try FormulaParser(book:checks,sheet:0).evaluate("EDATE(DATE(2024,1,31),1)").text == "43889","EDATE honors the workbook's 1904 date system")
         sheetCheck(try FormulaParser(book:checks,sheet:0).evaluate("EOMONTH(DATE(2024,2,10),0)").text == "43889","EOMONTH honors the workbook's 1904 date system")
+        try runV13ModelTests(out)
         print("ALL MODEL TESTS PASSED")
     } catch { fputs("FAIL: model tests: \(error)\n",stderr); exit(1) }
+}
+
+
+/// v1.3 structural changes are checked against exact package fields, not implementation mirrors.
+func runV13ModelTests(_ out: URL) throws {
+    let source = out.appendingPathComponent("v13.xlsx"), book = try Book(source)
+    try book.preparePackage()
+    let original = try book.packageSnapshot()
+    func formula(_ b: Book,_ s: Int,_ ref: String) throws -> String { try b.cell(s,ref)?.child("f")?.stringValue ?? "" }
+    func root(_ b: Book) throws -> XMLElement { try b.sheetDocument(0).rootElement()! }
+    func sameXML(_ b: Book,_ state: PackageSnapshot) throws -> Bool {
+        for (path,bytes) in state.documents { if try b.part(path).xmlData != bytes {
+            try bytes.write(to:out.appendingPathComponent("undo-before.xml")); try b.part(path).xmlData.write(to:out.appendingPathComponent("undo-after.xml")); print("XML DIFFERENCE: \(path)"); return false
+        } }; return true
+    }
+    func expect(_ change: GridChange,_ input: String,_ output: String,context: Int = 0) throws {
+        sheetCheck(try book.rewrite(input,context:context,target:0,change:change) == output,"Reference rewrite: \(input) → \(output)")
+    }
+    let insert = GridChange(rows:true,at:3,count:2,deleting:false),delete = GridChange(rows:true,at:3,count:2,deleting:true)
+    for (input,output) in [("$B$3+B3+B$3+$B3","$B$5+B5+B$5+$B5"),("SUM(B2:B4)","SUM(B2:B6)"),("SUM(3:3)+SUM(B:B)","SUM(5:5)+SUM(B:B)"),("IF(B3=1,\"B3\",Other!B3)","IF(B5=1,\"B3\",Other!B3)"),("LOG10(B3)","LOG10(B5)"),("'Data sheet'!B3+Other!B3","'Data sheet'!B5+Other!B3")] { try expect(insert,input,output) }
+    for (input,output) in [("SUM(B2:B6)","SUM(B2:B4)"),("SUM(B3:B4)","SUM(#REF!)"),("$B$3","#REF!"),("SUM(3:4)","SUM(#REF!)"),("SUM(B4:B6)","SUM(B3:B4)"),("'Data sheet'!B3","'Data sheet'!#REF!")] { try expect(delete,input,output) }
+    try expect(GridChange(rows:false,at:2,count:1,deleting:false),"SUM($A:$C)+$B$3","SUM($A:$D)+$C$3")
+    try expect(insert,"'Data sheet'!B3+B3","'Data sheet'!B5+B3",context:1)
+    sheetCheck(fillFormula("'Data sheet'!$B2+B$2+\"B2\"",down:1,right:2) == "'Data sheet'!$B3+D$2+\"B2\"","Copy uses the structural reference scanner while preserving absolute axes and strings")
+    try book.shiftGrid(0,change:insert)
+    sheetCheck(try formula(book,1,"A1") == "SUM('Data sheet'!$B$2:$B$6)" && formula(book,1,"A2") == "'Data sheet'!$B$5","Cross-sheet formulas and absolutes shift workbook-wide")
+    sheetCheck(try book.value(0,6,4).text == "60" && book.value(1,1,1).text == "60","Shared children and cross-sheet SUM compute after insertion")
+    sheetCheck(try book.cell(0,"D2")?.child("f")?.attr("ref") == "D2:D6","Shared master ref grows")
+    sheetCheck(try book.cell(0,"F12")?.child("f")?.attr("ref") == "F12:F13","Array formula ref moves without splitting the array")
+    let r = try root(book)
+    sheetCheck(r.child("autoFilter")?.attr("ref") == "A1:C6" && r.child("mergeCells")?.child("mergeCell")?.attr("ref") == "J2:K5","Filter and merged range grow")
+    sheetCheck(r.child("dataValidations")?.child("dataValidation")?.attr("sqref") == "B2:B6" && r.child("conditionalFormatting")?.attr("sqref") == "B2:B6","Data validation and conditional formatting scopes grow")
+    sheetCheck(r.child("conditionalFormatting")?.child("cfRule")?.child("formula")?.stringValue == "B2>0","Conditional formatting relative formula preserves its anchor")
+    sheetCheck(r.child("sheetData")?.kids("row").first(where:{ $0.attr("r") == "5" })?.attr("ht") == "30" && r.child("sheetData")?.kids("row").first(where:{ $0.attr("r") == "6" })?.attr("hidden") == "1","Row height/hidden move with rows")
+    let tablePath = try book.linked(book.sheets[0].path,type:"table")[0].1
+    sheetCheck(try book.part(tablePath).rootElement()?.attr("ref") == "A1:C6","Table range grows")
+    let names = try book.part("xl/workbook.xml").rootElement()!.child("definedNames")!.kids("definedName")
+    sheetCheck(names.first(where:{ $0.attr("name") == "SalesRange" })?.stringValue == "'Data sheet'!$B$2:$B$6","Global defined name shifts")
+    sheetCheck(names.first(where:{ $0.attr("name") == "_xlnm.Print_Area" })?.stringValue == "'Data sheet'!$A$1:$C$6","Print area shifts")
+    sheetCheck(r.child("sheetData")?.kids("row").first(where:{ $0.attr("r") == "5" })?.attr("spans") == "1:4","Row spans are rebuilt from moved cells")
+    sheetCheck(r.child("hyperlinks")?.child("hyperlink")?.attr("ref") == "C2","Hyperlink cell scope preserves its row above insertion")
+    let hyperlinkRels = try book.part(relationshipsPart(book.sheets[0].path)).rootElement()!.kids("Relationship")
+    sheetCheck(hyperlinkRels.first(where:{ $0.attr("Type").hasSuffix("/hyperlink") })?.attr("Target") == "#'Data sheet'!B5","Workbook-local hyperlink relationship follows its target")
+    let shiftedCharts = try book.readCharts(0)
+    let initialCharts = try Book(source).readCharts(0)
+    sheetCheck(shiftedCharts[1].frame.minY == initialCharts[1].frame.minY+54,"Existing drawing row anchors move with inserted rows")
+    sheetCheck(shiftedCharts.count == 10 && shiftedCharts[0].series[0].values.count == 5,"Chart series references grow with inserted rows")
+    try book.save(to:out.appendingPathComponent("v13-rows.xlsx"))
+    try book.restorePackage(original)
+    sheetCheck(try sameXML(book,original),"Structural undo restores every original XML byte")
+    try book.shiftGrid(0,change:GridChange(rows:true,at:3,count:1,deleting:true))
+    sheetCheck(try formula(book,1,"A2") == "'Data sheet'!#REF!" && book.value(1,2,1).text == "#REF!","Deleted cross-sheet cell computes #REF!, including with a cached formula")
+    sheetCheck(try book.value(0,3,4).text == "60" && book.cell(0,"D2")?.child("f")?.attr("ref") == "D2:D3","Shared formulas shrink and keep calculating")
+    sheetCheck(try root(book).child("mergeCells")?.child("mergeCell")?.attr("ref") == "J2:K2","Merge shrinks on deletion")
+    try book.restorePackage(original)
+    try book.shiftGrid(0,change:GridChange(rows:true,at:2,count:1,deleting:true))
+    sheetCheck(try book.value(0,2,4).text == "40" && formula(book,0,"D2") == "B2*2","Deleting a shared master promotes a surviving child")
+    sheetCheck(try root(book).child("conditionalFormatting")?.child("cfRule")?.child("formula")?.stringValue == "B2>0","Deleting a conditional format anchor rebases the relative formula")
+    try book.restorePackage(original)
+    try book.shiftGrid(0,change:GridChange(rows:false,at:2,count:1,deleting:false))
+    sheetCheck(try book.part(tablePath).rootElement()?.attr("ref") == "A1:D4" && book.part(tablePath).rootElement()?.child("tableColumns")?.attr("count") == "4","Table column insertion updates column definitions and header cell")
+    sheetCheck(try book.raw(0,"B1").hasPrefix(L("Colonna","Column")) && book.value(1,1,1).text == "60","Inserted table header is unique; cross-sheet values stay stable")
+    sheetCheck(try root(book).child("cols")?.kids("col").contains(where:{ $0.attr("min") == "4" && $0.attr("width") == "21" }) == true,"Column widths shift")
+    try book.save(to:out.appendingPathComponent("v13-cols.xlsx"))
+    try book.restorePackage(original)
+    try book.shiftGrid(0,change:GridChange(rows:false,at:2,count:1,deleting:true))
+    sheetCheck(try book.part(tablePath).rootElement()?.child("tableColumns")?.attr("count") == "2" && formula(book,1,"A1") == "SUM('Data sheet'!#REF!)","Column deletion removes table columns and invalidates fully deleted references")
+    try book.restorePackage(original)
+    for change in [GridChange(rows:true,at:11,count:1,deleting:false),GridChange(rows:true,at:10,count:1,deleting:true)] {
+        do { try book.shiftGrid(0,change:change); sheetCheck(false,"Refuse partial array edits") } catch { sheetCheck(try sameXML(book,original),"Refused partial array operation leaves every XML byte unchanged") }
+    }
+    // Insert at every data boundary, or delete pre-existing empty rows/columns.
+    let invariant = try Book.blank()
+    try invariant.applyEdits(0,[CellEdit(ref:"A1",value:"7",kind:.number),CellEdit(ref:"C3",value:"11",kind:.number),CellEdit(ref:"E5",value:"13",kind:.number)])
+    let expressions = ["$A$1+C3+$E5","SUM(A1:E5)","SUM(A:A)","SUM(3:3)","IF(C3>0,SUM($A$1:$E$5),0)","SUM(A1:C3)*2","SUM($1:$5)"]
+    for (i,f) in expressions.enumerated() { try invariant.setCell(0,"G\(i+1)",f,kind:.formula) }
+    try invariant.preparePackage(); let base = try invariant.packageSnapshot()
+    let values = try expressions.indices.map { try invariant.value(0,$0+1,7).text }
+    var passes = 0
+    for rows in [true,false] { for at in 1...9 { for deleting in [false,true] {
+        if deleting && (rows ? at<=7 : [1,3,5,7].contains(at)) { continue }
+        try invariant.restorePackage(base)
+        let change = GridChange(rows:rows,at:at,count:1,deleting:deleting)
+        try invariant.shiftGrid(0,change:change)
+        for i in expressions.indices {
+            let row = rows ? change.point(i+1)! : i+1,col = rows ? 7 : change.point(7)!
+            sheetCheck(try invariant.value(0,row,col).text == values[i],"INVARIANT \(rows ? "row" : "column") \(deleting ? "delete empty" : "insert") \(at), formula \(i+1)")
+        }; passes += 1
+    } } }
+    sheetCheck(passes == 25,"Invariant covers every insertion boundary and existing empty axes")
+    try book.restorePackage(original)
+    let models = try book.readCharts(0)
+    sheetCheck(models.map(\.kind) == ["column","column","column","bar","line","pie","doughnut","area","scatter","unsupported"],"Parse existing chart families and unsupported placeholder")
+    func marks(_ svg: String,_ kind: String) -> Int { svg.components(separatedBy:"data-mark='\(kind)'").count-1 }
+    sheetCheck(marks(chartSVG(models[0]),"bar") == 6 && marks(chartSVG(models[4]),"point") == 6 && marks(chartSVG(models[8]),"point") == 3,"SVG has exact bar, line-marker and scatter-point counts")
+    sheetCheck(marks(chartSVG(models[5]),"slice") == 3 && marks(chartSVG(models[6]),"slice") == 3 && marks(chartSVG(models[7]),"area") == 2,"SVG pie/doughnut slices and area polygons")
+    sheetCheck(chartSVG(models[9]).contains(L("Anteprima non disponibile","Preview unavailable")),"Unsupported chart keeps title and a localized placeholder")
+    let fallback = try XMLElement(xmlString:"<val><numRef><f>UnsupportedName</f><numCache><ptCount val='3'/><pt idx='0'><v>42</v></pt><pt idx='2'><v>7</v></pt></numCache></numRef></val>")
+    let cached = try book.chartValues(fallback,sheet:0,numeric:true)
+    sheetCheck(cached.count == 3 && cached[0].0.text == "42" && cached[1].0.text == "" && cached[2].0.text == "7","Unsupported chart references use sparse caches with their original point positions")
+    fallback.child("numRef")?.child("f")?.stringValue = "'Data sheet'!#REF!"
+    sheetCheck(try book.chartValues(fallback,sheet:0,numeric:true).isEmpty,"Deleted chart reference never resurrects cached points")
+    let chartRange = CellRange(r1:1,c1:1,r2:4,c2:3)
+    for kind in ["column","bar","line","pie"] { _ = try book.createChart(0,range:chartRange,kind:kind) }
+    sheetCheck(try book.readCharts(0).count == 14,"Create all four chart types alongside existing charts")
+    let created = try book.readCharts(0).last!,chartState = try book.packageSnapshot()
+    try book.setChartFrame(0,id:created.id,frame:CGRect(x:350,y:160,width:480,height:290))
+    sheetCheck(try book.readCharts(0).last!.frame == CGRect(x:350,y:160,width:480,height:290),"Move and resize chart using EMU anchors")
+    try book.save(to:out.appendingPathComponent("v13-charts.xlsx"))
+    let reopened = try Book(out.appendingPathComponent("v13-charts.xlsx"))
+    sheetCheck(try reopened.readCharts(0).count == 14 && reopened.readCharts(0).last!.frame == CGRect(x:350,y:160,width:480,height:290),"Chart anchors and every existing/new chart survive save/reopen")
+    try book.restorePackage(chartState); sheetCheck(try sameXML(book,chartState),"Move/resize undo restores exact XML")
+    let deletion = try book.packageSnapshot(); try book.deleteChart(0,id:created.id)
+    sheetCheck(try book.readCharts(0).count == 13,"Delete selected chart")
+    try book.save(to:out.appendingPathComponent("v13-chart-deleted.xlsx"))
+    sheetCheck(try Book(out.appendingPathComponent("v13-chart-deleted.xlsx")).readCharts(0).count == 13,"Chart deletion survives save/reopen")
+    try book.restorePackage(deletion); sheetCheck(try sameXML(book,deletion),"Chart deletion undo restores exact XML and relationships")
+    try book.setCell(0,"B2","99",kind:.number)
+    sheetCheck(try book.readCharts(0)[0].series[0].values[0] == 99,"Existing chart reads live edited cells")
+    try book.save(to:out.appendingPathComponent("v13-live.xlsx"))
+    try book.restorePackage(original); sheetCheck(try sameXML(book,original) && book.readCharts(0).count == 10,"Chart creation undo restores exact original package XML")
+    let single = try Book.blank(); try single.applyEdits(0,[CellEdit(ref:"A1",value:"Name",kind:.text),CellEdit(ref:"B1",value:"Value",kind:.text),CellEdit(ref:"A2",value:"Only",kind:.text),CellEdit(ref:"B2",value:"3",kind:.number)])
+    try single.preparePackage(); let empty = try single.packageSnapshot()
+    let id = try single.createChart(0,range:CellRange(r1:1,c1:1,r2:2,c2:2),kind:"pie")
+    sheetCheck(marks(chartSVG(try single.readCharts(0)[0]),"slice") == 1,"Single-slice pie uses a complete circle")
+    let anchorBefore = try single.packageSnapshot(),chartBefore = try single.readCharts(0)[0]
+    let (_,_,anchor) = try single.chartAnchor(0,id:id); anchor.removeAttribute(forName:"editAs")
+    try single.shiftGrid(0,change:GridChange(rows:true,at:3,count:1,deleting:false))
+    sheetCheck(try single.readCharts(0)[0].frame.height == chartBefore.frame.height+27,"Two-cell drawing to-anchor expands across inserted rows")
+    try single.restorePackage(anchorBefore)
+    try single.save(to:out.appendingPathComponent("v13-new.xlsx")); try single.deleteChart(0,id:id)
+    try single.save(to:out.appendingPathComponent("v13-empty.xlsx"))
+    sheetCheck(try Book(out.appendingPathComponent("v13-empty.xlsx")).readCharts(0).isEmpty,"Deleting the last chart removes drawing parts and links cleanly")
+    try single.restorePackage(empty); sheetCheck(try sameXML(single,empty),"Undo first chart creation restores empty workbook XML")
+    let unsafe = try Book(source); try unsafe.preparePackage()
+    try unsafe.cell(1,"A1")?.child("f")?.stringValue = "SUM(SalesTable[Sales])"
+    let unsafeState = try unsafe.packageSnapshot()
+    do { try unsafe.shiftGrid(0,change:insert); sheetCheck(false,"Refuse structured references") } catch { sheetCheck(try sameXML(unsafe,unsafeState),"Structured references refused without mutation") }
+    unsafe.documents["xl/pivotTables/pivotTable1.xml"] = try XMLDocument(xmlString:"<pivotTableDefinition/>",options:[])
+    do { try unsafe.shiftGrid(0,change:insert); sheetCheck(false,"Refuse pivot tables") } catch { sheetCheck(true,"Pivot tables refused explicitly") }
+    print("V1.3 MODEL TESTS PASSED")
 }
 
 func scheduleSheetTests(_ app: App, fixture: URL) {
@@ -678,6 +820,38 @@ func scheduleSheetTests(_ app: App, fixture: URL) {
             app.undoEdit(); sheetCheck((try! app.book!.raw(0,"B4")) == prior,"ONE Σ \(function) Undo")
             app.redoEdit(); await pause()
         }
+        app.book?.dirty = false
+        app.newWorkbook(); await wait("v1.3 workbook",{ !app.web.isLoading })
+        _ = await js("select(at(1,1))"); await wait("v1.3 origin",{ app.selectedRef == "A1" })
+        try! app.pasteText("Name\tAmount\none\t10\ntwo\t20"); await pause()
+        let gridXML = try! app.book!.sheetDocument(0).xmlData,gridActions = app.committedActions
+        _ = await js("rowMap.get(2).querySelector('th').dispatchEvent(new MouseEvent('mousedown',{bubbles:true,button:0}));document.dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));rowMap.get(3).querySelector('th').dispatchEvent(new MouseEvent('mousedown',{bubbles:true,button:0,shiftKey:true}));document.dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));rowMap.get(2).querySelector('th').dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true,clientX:20,clientY:100}))")
+        await wait("multi-row headers",{ app.selectedRange.r1 == 2 && app.selectedRange.r2 == 3 })
+        sheetCheck(await js("document.querySelector('#grid-menu button').textContent") as? String == gridActionTitle(rows:true,count:2,deleting:false),"Header context menu uses the selected row count")
+        _ = await js("document.querySelector('#grid-menu button').click()")
+        await wait("insert two rows",{ !app.web.isLoading && (try? app.book!.raw(0,"A4")) == "one" })
+        sheetCheck(app.committedActions == gridActions+1 && app.editUndo.groupingLevel == 0,"Header insertion is one closed undo step")
+        app.undoEdit(); await wait("structural undo",{ !app.web.isLoading && (try? app.book!.raw(0,"A2")) == "one" })
+        sheetCheck(try! app.book!.sheetDocument(0).xmlData == gridXML,"UI structural Undo restores exact sheet XML")
+        _ = await js("select(at(1,1));select(at(3,2),false,true)"); await wait("chart selection",{ app.selectedRange.count == 6 })
+        let chartMenu = NSMenuItem(title:"",action:#selector(App.createChartMenu(_:)),keyEquivalent:""); chartMenu.representedObject = "column"
+        let chartXML = try! app.book!.sheetDocument(0).xmlData
+        app.createChartMenu(chartMenu); await pause()
+        let renderedBars = await js("document.querySelectorAll('.chart-box svg [data-mark=bar]').length") as? Int
+        sheetCheck((try! app.book!.readCharts(0).count) == 1 && renderedBars == 2,"Insert Chart creates DrawingML and two live SVG bars")
+        let chartFrame = try! app.book!.readCharts(0)[0].frame
+        _ = await js("document.querySelector('.chart-box').dispatchEvent(new MouseEvent('mousedown',{bubbles:true,button:0,clientX:300,clientY:100}));document.dispatchEvent(new MouseEvent('mousemove',{bubbles:true,clientX:340,clientY:130}));document.dispatchEvent(new MouseEvent('mouseup',{bubbles:true}))")
+        await pause()
+        sheetCheck((try! app.book!.readCharts(0)[0].frame.minX) == chartFrame.minX+40,"Chart dragging saves the moved anchor")
+        _ = await js("const corner=document.querySelector('.chart-resize');corner.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,button:0,clientX:500,clientY:300}));document.dispatchEvent(new MouseEvent('mousemove',{bubbles:true,clientX:540,clientY:320}));document.dispatchEvent(new MouseEvent('mouseup',{bubbles:true}))")
+        await pause()
+        sheetCheck((try! app.book!.readCharts(0)[0].frame.width) == chartFrame.width+40,"Corner dragging saves resized chart dimensions")
+        _ = await js("document.querySelector('.chart-box').dispatchEvent(new MouseEvent('mousedown',{bubbles:true,button:0,clientX:300,clientY:100}));document.dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));document.querySelector('.chart-box').dispatchEvent(new KeyboardEvent('keydown',{bubbles:true,key:'Delete'}))")
+        await pause(); sheetCheck((try! app.book!.readCharts(0).isEmpty),"Delete removes selected chart without clearing cells")
+        app.undoEdit(); await pause(); sheetCheck((try! app.book!.readCharts(0).count) == 1,"ONE Undo restores deleted chart")
+        app.undoEdit(); await pause(); sheetCheck((try! app.book!.readCharts(0)[0].frame.width) == chartFrame.width,"ONE Undo restores chart size")
+        app.undoEdit(); await pause(); sheetCheck((try! app.book!.readCharts(0)[0].frame) == chartFrame,"ONE Undo restores chart position")
+        app.undoEdit(); await pause(); sheetCheck((try! app.book!.readCharts(0).isEmpty) && (try! app.book!.sheetDocument(0).xmlData) == chartXML,"ONE Undo removes chart creation and restores original XML")
         app.book?.dirty = false
         print("ALL EXTENDED UI TESTS PASSED")
         scheduleLegacySheetTests(app,fixture:fixture)
