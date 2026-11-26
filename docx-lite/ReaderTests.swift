@@ -30,6 +30,24 @@ func scheduleReaderTests(_ reader: ReaderApp, fixture: URL) {
             check(tableCount >= 4, "Table cells")
             check(links > 0, "Hyperlink")
             check(bold > 0, "Bold formatting")
+            // styles.xml formatting and switched-off toggles (AppKit's importer ignores the first, inverts the second)
+            let stylesURL = fixture.deletingLastPathComponent().appendingPathComponent("styles.docx")
+            let stylesBefore = try Data(contentsOf: stylesURL)
+            let styled = try WordDocument(url: stylesURL)
+            func fontOf(_ needle: String) -> NSFont? {
+                let r = (styled.text.string as NSString).range(of: needle)
+                return r.location == NSNotFound ? nil : styled.text.attribute(.font, at: r.location, effectiveRange: nil) as? NSFont
+            }
+            func has(_ needle: String, _ trait: NSFontDescriptor.SymbolicTraits) -> Bool { fontOf(needle)?.fontDescriptor.symbolicTraits.contains(trait) == true }
+            check(fontOf("Styled title").map { abs($0.pointSize - 28) < 0.5 } == true && has("Styled title", .bold), "Title style size and bold applied")
+            check(fontOf("Styled heading").map { abs($0.pointSize - 16) < 0.5 } == true && has("Styled heading", .bold), "Heading 1 style applied")
+            let bulletRange = (styled.text.string as NSString).range(of: "Styled bullet")
+            check(bulletRange.location != NSNotFound && (styled.text.attribute(.paragraphStyle, at: bulletRange.location, effectiveRange: nil) as? NSParagraphStyle)?.textLists.isEmpty == false, "List style numbering becomes a list")
+            check(fontOf("Not bold explicitly").map { abs($0.pointSize - 12) < 0.5 } == true && !has("Not bold explicitly", .bold), "w:b w:val=0 is not bold, docDefaults size kept")
+            check(!has("Not italic explicitly", .italic), "w:i w:val=false is not italic")
+            check(!has("Override not bold", .bold) && has("Inherited bold", .bold), "Run override beats bold paragraph style")
+            check(has("Character style italic", .italic), "Character style applied")
+            check((try? Data(contentsOf: stylesURL)) == stylesBefore, "Style pass leaves the file on disk untouched")
             reader.display(doc, url: fixture)
             check(reader.textView.isEditable && reader.textView.isSelectable, "Editable selectable text")
             check(!reader.isDirty && !reader.window.isDocumentEdited && reader.status.stringValue.contains(L("Salvato", "Saved")), "Opening rich DOCX leaves document clean and status saved")

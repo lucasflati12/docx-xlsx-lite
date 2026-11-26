@@ -392,7 +392,10 @@ final class Book {
     private var indexes: [Int: SheetIndex] = [:]
     private var memo: [Int: FValue] = [:]
     private var evaluating = Set<Int>()
-    func invalidate() { indexes.removeAll(); memo.removeAll(); calculationTime = Date() }
+    /// Values of ranges already read during this calculation (SUMIF(B:B,…) repeated over many cells).
+    /// Cleared together with `memo`; never stores a range that contains a cell still being evaluated.
+    private var rangeMemo: [[Int]: [FValue]] = [:]
+    func invalidate() { indexes.removeAll(); memo.removeAll(); rangeMemo.removeAll(); calculationTime = Date() }
     static let general: NumberFormatter = { let f = NumberFormatter(); f.locale = .current; f.numberStyle = .decimal; f.usesGroupingSeparator = false; f.maximumFractionDigits = 10; return f }()
 
     init(_ url: URL) throws {
@@ -600,8 +603,15 @@ final class Book {
         _ = try index(sheet)
         let lastRow = r2, lastCol = c2
         guard (lastRow - r1 + 1) * (lastCol - c1 + 1) <= 2_000_000 else { throw FormulaUnsupported() }
-        var out: [FValue] = []
+        let cacheKey = [sheet, r1, c1, lastRow, lastCol]
+        if let cached = rangeMemo[cacheKey] { return cached }
+        var out: [FValue] = []; out.reserveCapacity((lastRow - r1 + 1) * (lastCol - c1 + 1))
         for r in r1...lastRow { for c in c1...lastCol { out.append(try value(sheet, r, c)) } }
+        let containsPending = evaluating.contains { key in
+            let r = (key & ((1 << 40) - 1)) / 16385, c = (key & ((1 << 40) - 1)) % 16385
+            return key >> 40 == sheet && r >= r1 && r <= lastRow && c >= c1 && c <= lastCol
+        }
+        if !containsPending { rangeMemo[cacheKey] = out }
         return out
     }
     func isNumeric(_ cell: XMLElement) -> Bool {
@@ -1411,7 +1421,7 @@ final class Book {
     func render(_ index: Int) throws -> Rendered {
         let doc = try sheetDocument(index)
         guard let root = doc.rootElement() else { throw failure(L("Foglio non leggibile.", "Unreadable sheet.")) }
-        memo.removeAll(); calculationTime = Date()
+        memo.removeAll(); rangeMemo.removeAll(); calculationTime = Date()
         let sheetIndex = try self.index(index)
         let grid = sheetIndex.cells, hiddenRows = sheetIndex.hiddenRows
         let geometry = GridGeometry(root)
@@ -1484,10 +1494,15 @@ final class Book {
         html += "</colgroup><thead><tr><th style='left:0;z-index:9'></th>"
         for c in columns { html += "<th data-c='\(c)'\(c <= frozenCols ? " style='left:\(Int(offsets[c] ?? 40))px;z-index:8'" : "")>\(columnName(c))</th>" }
         html += "</tr></thead><tbody>"
-        for r in rows {
+        // Progressive rendering: the first rows ship in the page so it paints at once; the rest follows in
+        // 1,000-row chunks appended by the page script (flushRest() completes them before any interaction).
+        let headRowCount = 150
+        var restChunks: [String] = [], restCurrent = "", restCount = 0
+        for (rowIndex, r) in rows.enumerated() {
+            var rowHTML = ""; rowHTML.reserveCapacity(64 * columns.count)
             let isFrozen = r <= frozenRows, top = r <= frozenRows ? Int(geometry.point(col:0,row:r-1).y) : 0
             let rowHeight = geometry.heights[r].map { " style='height:\(chartNumber($0))px'" } ?? ""
-            html += "<tr\(rowHeight) data-row='\(r)'\(r == frozenRows && frozenRows > 0 ? " class='heading'" : "")><th\(isFrozen ? " style='top:\(top)px;z-index:8'" : "")>\(r)</th>"
+            rowHTML += "<tr\(rowHeight) data-row='\(r)'\(r == frozenRows && frozenRows > 0 ? " class='heading'" : "")><th\(isFrozen ? " style='top:\(top)px;z-index:8'" : "")>\(r)</th>"
             for c in columns {
                 let key = cellKey(r, c); if covered.contains(key) { if !firstNumber { numericJS += "," }; firstNumber = false; numericJS += "null"; continue }
                 let cell = grid[key] ?? sheetIndex.blankCells[key]
@@ -1508,16 +1523,20 @@ final class Book {
                     } else if ["","n"].contains(cell.attr("t")), let text = cell.child("v")?.stringValue, let n = Double(text), n.isFinite { numeric = n }
                 }
                 if !firstNumber { numericJS += "," }; firstNumber = false; numericJS += numeric.map { FValue.number($0).text } ?? "null"
-                html += "<td data-c='\(c)'"
-                if numeric != nil && sty.kind != .text { html += " n" }
-                if !classes.isEmpty { html += " class='\(classes.joined(separator:" "))'" }
-                if let span = merges[key] { html += " colspan='\(span.0)' rowspan='\(span.1)'" }
-                if !css.isEmpty { html += " style='\(css)'" }
-                if value.contains("\n") { html += " data-full='\(esc(value))'" }
-                html += ">\(esc(value.replacingOccurrences(of:"\n",with:" ")))</td>"
+                rowHTML += "<td data-c='\(c)'"
+                if numeric != nil && sty.kind != .text { rowHTML += " n" }
+                if !classes.isEmpty { rowHTML += " class='\(classes.joined(separator:" "))'" }
+                if let span = merges[key] { rowHTML += " colspan='\(span.0)' rowspan='\(span.1)'" }
+                if !css.isEmpty { rowHTML += " style='\(css)'" }
+                if value.contains("\n") { rowHTML += " data-full='\(esc(value))'" }
+                rowHTML += ">\(esc(value.replacingOccurrences(of:"\n",with:" ")))</td>"
             }
-            html += "</tr>"
+            rowHTML += "</tr>"
+            if rowIndex < headRowCount { html += rowHTML }
+            else { restCurrent += rowHTML; restCount += 1; if restCount == 1000 { restChunks.append(restCurrent); restCurrent = ""; restCount = 0 } }
         }
+        if !restCurrent.isEmpty { restChunks.append(restCurrent) }
+        let restJSON = String(data: try JSONSerialization.data(withJSONObject: restChunks), encoding: .utf8)!.replacingOccurrences(of: "<", with: "\\u003c")
         numericJS += "]"
         let formulaJSON = String(data:try JSONSerialization.data(withJSONObject:formulaRaw),encoding:.utf8)!.replacingOccurrences(of:"<",with:"\\u003c")
         html += """
@@ -1535,7 +1554,7 @@ final class Book {
         const bar=document.getElementById('formula'),nameBox=document.getElementById('name'),stats=document.getElementById('stats');
         const COLS=\(columns),numbers=new Map(),raws=new Map(Object.entries(\(formulaJSON)).map(([k,v])=>[+k,v]));
         const keyOf=td=>+td.parentElement.dataset.row*16385+(+td.dataset.c);
-        (()=>{const values=\(numericJS);let i=0;for(const row of rows)for(const c of COLS){const n=values[i++];if(n!==null)numbers.set(+row.dataset.row*16385+c,n)}})();
+        const NUMV=\(numericJS);let numI=0;function indexRows(list){for(const row of list)for(const c of COLS){const n=NUMV[numI++];if(n!==null)numbers.set(+row.dataset.row*16385+c,n)}}indexRows(rows);const REST=\(restJSON);let restI=0;function appendRestChunk(){const tb=document.querySelector('table>tbody'),before=tb.rows.length;tb.insertAdjacentHTML('beforeend',REST[restI++]);const added=Array.prototype.slice.call(tb.rows,before);for(const r of added){rows.push(r);rowMap.set(+r.dataset.row,r)}indexRows(added)}function flushRest(){while(restI<REST.length)appendRestChunk()}window.flushRest=flushRest;function pumpRest(){if(restI<REST.length){appendRestChunk();setTimeout(pumpRest,0)}}['keydown','mousedown','paste','copy','cut','dblclick','contextmenu'].forEach(t=>addEventListener(t,flushRest,true));requestAnimationFrame(()=>setTimeout(pumpRest,40));
         const raw=td=>raws.get(keyOf(td))??(numbers.has(keyOf(td))?String(numbers.get(keyOf(td))):full(td));
         function closeFilter(){document.getElementById('filter-menu')?.remove()}
         function dataRows(){return rows.filter(r=>{const n=+r.dataset.row;return n>FR&&n<=FL})}
@@ -1854,22 +1873,33 @@ final class FormulaParser {
         }
         switch op { case "=": return order == 0; case "<>": return order != 0; case "<": return order < 0; case ">": return order > 0; case "<=": return order <= 0; default: return order >= 0 }
     }
-    func matches(_ value: FValue, _ criterion: FValue) -> Bool {
+    func matches(_ value: FValue, _ criterion: FValue) -> Bool { criterionMatcher(criterion)(value) }
+    /// Parses a SUMIF/COUNTIF-style criterion once and returns a matcher with exactly the semantics of the
+    /// per-cell version (operator, wildcard, numeric target, empty cells), so ranges of 20k+ cells stay fast.
+    func criterionMatcher(_ criterion: FValue) -> (FValue) -> Bool {
         var text = criterion.text, op = "="
         for candidate in ["<>", "<=", ">=", "<", ">", "="] where text.hasPrefix(candidate) { op = candidate; text = String(text.dropFirst(candidate.count)); break }
         if (op == "=" || op == "<>"), text.contains("*") || text.contains("?") || text.contains("~") {
-            guard case .text(let actual) = value else { return op == "<>" }
-            let yes = wildcard(text, actual)
-            return op == "=" ? yes : !yes
+            let pattern = text, equal = op == "="
+            return { value in
+                guard case .text(let actual) = value else { return !equal }
+                let yes = self.wildcard(pattern, actual)
+                return equal ? yes : !yes
+            }
         }
-        let target: FValue = automaticNumber(text).map { .number($0) } ?? .text(text)
-        if case .empty = value { if automaticNumber(text) == 0 { return compare(.number(0),op,.number(0)) }; return op == "=" ? text.isEmpty : (op == "<>" ? !text.isEmpty : false) }
-        if case .number = target, case .text(let s) = value {
-            guard let n = automaticNumber(s) else { return op == "<>" }; return compare(.number(n),op,target)
+        let number = automaticNumber(text)
+        let target: FValue = number.map { .number($0) } ?? .text(text)
+        let emptyResult = number == 0 ? compare(.number(0),op,.number(0)) : (op == "=" ? text.isEmpty : (op == "<>" ? !text.isEmpty : false))
+        let numericTarget = number != nil
+        return { value in
+            if case .empty = value { return emptyResult }
+            if numericTarget, case .text(let s) = value {
+                guard let n = automaticNumber(s) else { return op == "<>" }; return self.compare(.number(n),op,target)
+            }
+            if numericTarget, case .bool(let b) = value { return self.compare(.number(b ? 1 : 0),op,target) }
+            if !numericTarget, !(value.isTextual) { return self.compare(.text(value.text),op,target) }
+            return self.compare(value, op, target)
         }
-        if case .number = target, case .bool(let b) = value { return compare(.number(b ? 1 : 0),op,target) }
-        if case .text = target, !(value.isTextual) { return compare(.text(value.text),op,target) }
-        return compare(value, op, target)
     }
     func wildcard(_ pattern: String, _ value: String) -> Bool {
         if patterns[pattern] == nil {
@@ -1995,7 +2025,7 @@ final class FormulaParser {
             case "TRIM": return .text(arg(0).text.split(separator: " ").joined(separator: " "))
             case "SUMIF", "COUNTIF", "AVERAGEIF":
                 let range = arg(0).items, values = args.count > 2 ? arg(2).items : range
-                let picked = range.indices.filter { matches(range[$0], arg(1)) }
+                let match = criterionMatcher(arg(1)), picked = range.indices.filter { match(range[$0]) }
                 if arg(1).isError { return arg(1) }
                 if name == "COUNTIF" { return .number(Double(picked.count)) }
                  if let e = picked.compactMap({ values.indices.contains($0) ? values[$0] : nil }).first(where: \.isError) { return e }
@@ -2011,9 +2041,9 @@ final class FormulaParser {
                 for j in stride(from: start, to: args.count, by: 2) {
                     if arg(j).shape != shape { return .error("#VALUE!") }; if arg(j+1).isError { return arg(j+1) }
                 }
-                let ranges = stride(from: start, to: args.count, by: 2).map { (arg($0).items,arg($0+1)) }
+                let ranges = stride(from: start, to: args.count, by: 2).map { (arg($0).items,criterionMatcher(arg($0+1))) }
                 var picked: [FValue] = [], count = 0
-                for i in base.indices where ranges.allSatisfy({ matches($0.0[i], $0.1) }) { count += 1; picked.append(values[i]) }
+                for i in base.indices where ranges.allSatisfy({ $0.1($0.0[i]) }) { count += 1; picked.append(values[i]) }
                 if name == "COUNTIFS" { return .number(Double(count)) }
                 if let e = picked.first(where: \.isError) { return e }
                 let ns = picked.compactMap { v -> Double? in if case .number(let n) = v { return n }; return nil }
@@ -2265,12 +2295,12 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
         window.isDocumentEdited = book?.dirty ?? false
         notice.stringValue = (book?.dirty == true) ? L("Modifiche non salvate", "Unsaved changes") : hint
     }
-    @objc func clearFilters() { web.evaluateJavaScript("window.clearFilters&&clearFilters()", completionHandler: nil) }
-    @objc func undoMenu() { if let text = window.firstResponder as? NSTextView { text.undoManager?.undo(); return }; web.evaluateJavaScript("gridUndo(false)",completionHandler:nil) }
-    @objc func redoMenu() { if let text = window.firstResponder as? NSTextView { text.undoManager?.redo(); return }; web.evaluateJavaScript("gridUndo(true)",completionHandler:nil) }
-    @objc func selectAllCells() { if let text = window.firstResponder as? NSTextView { text.selectAll(nil); return }; web.evaluateJavaScript("gridSelectAll()",completionHandler:nil) }
-    @objc func undoEdit() { editUndo.undo(); updateEditState(); web.evaluateJavaScript("editResult(true,'')",completionHandler:nil) }
-    @objc func redoEdit() { editUndo.redo(); updateEditState(); web.evaluateJavaScript("editResult(true,'')",completionHandler:nil) }
+    @objc func clearFilters() { web.gridJS("window.clearFilters&&clearFilters()", completionHandler: nil) }
+    @objc func undoMenu() { if let text = window.firstResponder as? NSTextView { text.undoManager?.undo(); return }; web.gridJS("gridUndo(false)",completionHandler:nil) }
+    @objc func redoMenu() { if let text = window.firstResponder as? NSTextView { text.undoManager?.redo(); return }; web.gridJS("gridUndo(true)",completionHandler:nil) }
+    @objc func selectAllCells() { if let text = window.firstResponder as? NSTextView { text.selectAll(nil); return }; web.gridJS("gridSelectAll()",completionHandler:nil) }
+    @objc func undoEdit() { editUndo.undo(); updateEditState(); web.gridJS("editResult(true,'')",completionHandler:nil) }
+    @objc func redoEdit() { editUndo.redo(); updateEditState(); web.gridJS("editResult(true,'')",completionHandler:nil) }
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         if item.action == #selector(gridMenu(_:)),let command = item.representedObject as? String {
             let parts = command.split(separator:":"),rows = parts[0] == "row",count = rows ? selectedRange.r2-selectedRange.r1+1 : selectedRange.c2-selectedRange.c1+1
@@ -2296,7 +2326,7 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
             committedActions += 1
             editUndo.record(self,name:name) { $0.restoreWorkbook(old,generation:generation,reload:reload) }
             if reload { reloadGrid() } else { refreshCharts() }
-            updateEditState(); lastEditError = ""; web.evaluateJavaScript("editResult(true,'')",completionHandler:nil)
+            updateEditState(); lastEditError = ""; web.gridJS("editResult(true,'')",completionHandler:nil)
         } catch { editError(error) }
     }
     func restoreWorkbook(_ state: PackageSnapshot, generation: Int, reload: Bool) {
@@ -2315,7 +2345,7 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
     }
     func refreshCharts() {
         guard let book,let html = try? book.chartHTML(picker.indexOfSelectedItem) else { return }
-        web.evaluateJavaScript("window.setCharts&&setCharts(\(jsonString(html)))",completionHandler:nil)
+        web.gridJS("window.setCharts&&setCharts(\(jsonString(html)))",completionHandler:nil)
     }
     func changeGrid(rows: Bool, position: String) {
         let lo = rows ? selectedRange.r1 : selectedRange.c1,hi = rows ? selectedRange.r2 : selectedRange.c2
@@ -2340,11 +2370,11 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
             updateEditState(); syncFilter(); updateFormatControls()
         } catch { editError(error) }
     }
-    @objc func editCell() { web.evaluateJavaScript("beginEdit()",completionHandler:nil) }
+    @objc func editCell() { web.gridJS("beginEdit()",completionHandler:nil) }
     func editError(_ error: Error) {
         lastEditError = error.localizedDescription
         let json = jsonString(lastEditError)
-        web.evaluateJavaScript("editResult(false,\(json))",completionHandler:nil)
+        web.gridJS("editResult(false,\(json))",completionHandler:nil)
     }
     func jsonString(_ text: String) -> String { String(data:try! JSONSerialization.data(withJSONObject:text,options:.fragmentsAllowed),encoding:.utf8)! }
     func restoreCells(_ index: Int, _ snapshots: [CellSnapshot], dirty: Bool, generation: Int) {
@@ -2359,7 +2389,7 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
     }
     func commitEdits(_ edits: [CellEdit]) throws {
         guard let book else { return }
-        guard !edits.isEmpty else { web.evaluateJavaScript("editResult(true,'')",completionHandler:nil); return }
+        guard !edits.isEmpty else { web.gridJS("editResult(true,'')",completionHandler:nil); return }
         let index = picker.indexOfSelectedItem
         let edits = try edits.filter { edit in
             let raw = try book.raw(index,edit.ref)
@@ -2369,15 +2399,15 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
             case .number: return !["","n"].contains(type) || raw != edit.value
             case .text: return !["inlineStr","s","str"].contains(type) || raw != edit.value }
         }
-        guard !edits.isEmpty else { web.evaluateJavaScript("editResult(true,'')",completionHandler:nil); return }
+        guard !edits.isEmpty else { web.gridJS("editResult(true,'')",completionHandler:nil); return }
         let refs = edits.map(\.ref), old = try book.snapshots(index,refs:refs), wasDirty = book.dirty, generation = savedGeneration
         try book.applyEdits(index,edits)
         let changed = try book.snapshots(index,refs:refs)
-        guard zip(old,changed).contains(where: { $0.cell?.xmlString != $1.cell?.xmlString }) else { web.evaluateJavaScript("editResult(true,'')",completionHandler:nil); return }
+        guard zip(old,changed).contains(where: { $0.cell?.xmlString != $1.cell?.xmlString }) else { web.gridJS("editResult(true,'')",completionHandler:nil); return }
         committedActions += 1
         editUndo.record(self,name:L("Modifica celle","Edit Cells")) { $0.restoreCells(index,old,dirty:wasDirty,generation:generation) }
         refreshFormulas(index,refs:refs); updateEditState(); lastEditError = ""
-        web.evaluateJavaScript("editResult(true,'')",completionHandler:nil)
+        web.gridJS("editResult(true,'')",completionHandler:nil)
     }
     /// Refresh only the affected cells plus all formula cells, without replacing the document.
     func refreshFormulas(_ index: Int, select ref: String) { refreshFormulas(index,refs:[ref]) }
@@ -2395,7 +2425,7 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
             updates.append([r,c,value,editedKeys.contains(key) ? 1 : 0,raw,numeric,cell.map { book.style($0).css } ?? ""])
         }
         guard let data = try? JSONSerialization.data(withJSONObject:updates), let json = String(data:data,encoding:.utf8) else { return }
-        web.evaluateJavaScript("setCells(\(json))",completionHandler:nil); refreshCharts()
+        web.gridJS("setCells(\(json))",completionHandler:nil); refreshCharts()
         if !selectedRef.isEmpty { let selected = idx.cells[cellKey(rowNumber(selectedRef),column(selectedRef))] ?? idx.blankCells[cellKey(rowNumber(selectedRef),column(selectedRef))]; showDetail(selectedRef,selected.map { book.display($0,sheet:index) } ?? "") }
     }
     func selectedEdits(_ text: String) throws -> [CellEdit] {
@@ -2412,10 +2442,10 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
         do { let text = try clipboardText(); let pb = NSPasteboard.general; pb.clearContents(); pb.setString(text,forType:.string); pb.setString(text,forType:.tabularText); pb.setString(text,forType:NSPasteboard.PasteboardType("public.utf8-tab-separated-values-text")) } catch { editError(error) }
     }
     @objc func cutSelection() { copySelection(); clearSelection() }
-    @objc func copyCells() { if let text = window.firstResponder as? NSTextView { text.copy(nil); return }; web.evaluateJavaScript("gridClipboard('copy')",completionHandler:nil) }
-    @objc func cutCells() { if let text = window.firstResponder as? NSTextView { text.cut(nil); return }; web.evaluateJavaScript("gridClipboard('cut')",completionHandler:nil) }
-    @objc func pasteCells() { if let text = window.firstResponder as? NSTextView { text.paste(nil); return }; web.evaluateJavaScript("gridClipboard('paste')",completionHandler:nil) }
-    @objc func pasteSelection() { if let text = NSPasteboard.general.string(forType:.string) { do { try pasteText(text) } catch { editError(error) } } else { web.evaluateJavaScript("editResult(true,'')",completionHandler:nil) } }
+    @objc func copyCells() { if let text = window.firstResponder as? NSTextView { text.copy(nil); return }; web.gridJS("gridClipboard('copy')",completionHandler:nil) }
+    @objc func cutCells() { if let text = window.firstResponder as? NSTextView { text.cut(nil); return }; web.gridJS("gridClipboard('cut')",completionHandler:nil) }
+    @objc func pasteCells() { if let text = window.firstResponder as? NSTextView { text.paste(nil); return }; web.gridJS("gridClipboard('paste')",completionHandler:nil) }
+    @objc func pasteSelection() { if let text = NSPasteboard.general.string(forType:.string) { do { try pasteText(text) } catch { editError(error) } } else { web.gridJS("editResult(true,'')",completionHandler:nil) } }
     func pasteText(_ text: String) throws {
         guard let book else { return }; let rows = parseTSV(text), i = picker.indexOfSelectedItem
         if rows.count == 1, rows[0].count == 1 { try commitEdits(selectedEdits(rows[0][0])); return }
@@ -2431,10 +2461,10 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
             let old = try book.sheetDocument(i).xmlData, wasDirty = book.dirty, idx = try book.index(i), generation = savedGeneration
             try book.sort(i,column:col ?? selectedRange.c1,row:selectedRange.r1,ascending:ascending)
             let newIndex = try book.index(i), refs = Set(idx.cells.keys).union(newIndex.cells.keys).map { columnName($0%16385)+String($0/16385) }
-            guard try book.sheetDocument(i).xmlData != old else { web.evaluateJavaScript("editResult(true,'')",completionHandler:nil); return }; committedActions += 1
+            guard try book.sheetDocument(i).xmlData != old else { web.gridJS("editResult(true,'')",completionHandler:nil); return }; committedActions += 1
             editUndo.record(self,name:L("Ordina","Sort")) { $0.restoreSheet(i,old,dirty:wasDirty,refs:refs,generation:generation) }
             refreshFormulas(i,refs:refs); updateEditState(); lastEditError = ""
-            web.evaluateJavaScript("editResult(true,'')",completionHandler:nil)
+            web.gridJS("editResult(true,'')",completionHandler:nil)
         } catch { editError(error) }
     }
     @objc func newWorkbook() {
@@ -2460,15 +2490,15 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
         do { try persist(to:book.url); return true } catch { show(error); return false }
     }
     @objc func fillDown() {
-        guard let book, selectedRange.r2>selectedRange.r1 else { web.evaluateJavaScript("editResult(true,'')",completionHandler:nil); return }
+        guard let book, selectedRange.r2>selectedRange.r1 else { web.gridJS("editResult(true,'')",completionHandler:nil); return }
         do {
             var edits: [CellEdit] = []; let i = picker.indexOfSelectedItem
             for c in selectedRange.c1...selectedRange.c2 { let value = try book.raw(i,columnName(c)+String(selectedRange.r1)); for r in (selectedRange.r1+1)...selectedRange.r2 { edits.append(try book.automaticEdit(i,columnName(c)+String(r),value.hasPrefix("=") ? "="+fillFormula(String(value.dropFirst()),down:r-selectedRange.r1) : value)) } }
             try commitEdits(edits)
         } catch { editError(error) }
     }
-    @objc func toggleFreeze() { web.evaluateJavaScript("toggleFreeze()",completionHandler:nil) }
-    @objc func autoWidth() { web.evaluateJavaScript("autoWidth(current?+current.dataset.c:1)",completionHandler:nil) }
+    @objc func toggleFreeze() { web.gridJS("toggleFreeze()",completionHandler:nil) }
+    @objc func autoWidth() { web.gridJS("autoWidth(current?+current.dataset.c:1)",completionHandler:nil) }
     var formatControls: [String:NSControl] = [:]
     var paintStyle: Int?
     var selectedStyle: CellStyle {
@@ -2519,7 +2549,7 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
             committedActions += 1
             editUndo.record(self,name:L("Formato celle","Format Cells")) { $0.restoreCells(index,old,dirty:dirty,generation:generation) }
             refreshFormulas(index,refs:refs); updateEditState(); updateFormatControls()
-            web.evaluateJavaScript("busy=false;document.getElementById('message').textContent='';selectionFurniture()",completionHandler:nil)
+            web.gridJS("busy=false;document.getElementById('message').textContent='';selectionFurniture()",completionHandler:nil)
         } catch { editError(error) }
     }
     @objc func formatAction(_ sender: NSControl) {
@@ -2540,7 +2570,7 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
         case "paint":
             guard let book, !selectedRef.isEmpty else { return }
             let cell = try? book.cell(picker.indexOfSelectedItem,selectedRef)
-            paintStyle = Int(cell?.attr("s") ?? "") ?? 0; web.evaluateJavaScript("armPaint(true)",completionHandler:nil)
+            paintStyle = Int(cell?.attr("s") ?? "") ?? 0; web.gridJS("armPaint(true)",completionHandler:nil)
         case "filter": toggleAutoFilter()
         default: break
         }
@@ -2563,7 +2593,7 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
         guard let book else { return }
         let parts = ((try? book.sheetDocument(picker.indexOfSelectedItem).rootElement()?.child("autoFilter")?.attr("ref")) ?? "").split(separator:":").map(String.init)
         let first = parts.first ?? "", last = parts.last ?? ""
-        web.evaluateJavaScript("window.setFilterRegion&&setFilterRegion(\(rowNumber(first)),\(column(first)),\(rowNumber(last)),\(column(last)))",completionHandler:nil)
+        web.gridJS("window.setFilterRegion&&setFilterRegion(\(rowNumber(first)),\(column(first)),\(rowNumber(last)),\(column(last)))",completionHandler:nil)
         updateFormatControls()
     }
     @objc func toggleAutoFilter() {
@@ -2658,9 +2688,11 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
     func find(backwards: Bool) {
         guard !search.stringValue.isEmpty, book != nil else { return }
         let config = WKFindConfiguration(); config.wraps = true; config.backwards = backwards; config.caseSensitive = false
-        web.find(search.stringValue, configuration: config) { result in
-            self.notice.stringValue = result.matchFound ? self.hint : L("Nessun risultato in questo foglio", "No results in this sheet")
-            if !result.matchFound { NSSound.beep() }
+        web.gridJS("0") { _, _ in
+            self.web.find(self.search.stringValue, configuration: config) { result in
+                self.notice.stringValue = result.matchFound ? self.hint : L("Nessun risultato in questo foglio", "No results in this sheet")
+                if !result.matchFound { NSSound.beep() }
+            }
         }
     }
     @objc func nextSheet() { moveSheet(1) }
@@ -2674,10 +2706,12 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
         let info = NSPrintInfo.shared.copy() as! NSPrintInfo
         info.orientation = .landscape; info.horizontalPagination = .fit; info.verticalPagination = .automatic
         info.leftMargin = 24; info.rightMargin = 24; info.topMargin = 24; info.bottomMargin = 24
-        let operation = web.printOperation(with: info)
-        operation.view?.frame = web.bounds
-        operation.jobTitle = book.url.deletingPathExtension().lastPathComponent + " – " + (picker.titleOfSelectedItem ?? "")
-        operation.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil)
+        web.gridJS("0") { _, _ in
+            let operation = self.web.printOperation(with: info)
+            operation.view?.frame = self.web.bounds
+            operation.jobTitle = book.url.deletingPathExtension().lastPathComponent + " – " + (self.picker.titleOfSelectedItem ?? "")
+            operation.runModal(for: self.window, delegate: nil, didRun: nil, contextInfo: nil)
+        }
     }
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         guard let data = message.body as? [String:String] else { return }
@@ -2704,15 +2738,15 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
             guard let id = data["id"] else { return }
             packageAction(L("Elimina grafico","Delete Chart"),{ book,i in try book.deleteChart(i,id:id) })
         case "fillDown": fillDown()
-        case "paint": if let style = paintStyle { paintStyle = nil; formatSelection(.copy(style)); web.evaluateJavaScript("armPaint(false)",completionHandler:nil) }
+        case "paint": if let style = paintStyle { paintStyle = nil; formatSelection(.copy(style)); web.gridJS("armPaint(false)",completionHandler:nil) }
         case "cancelPaint": paintStyle = nil
         case "autofill":
             guard let book else { return }
             func range(_ key: String) -> CellRange? { guard let text = data[key], let bytes = text.data(using:.utf8), let obj = (try? JSONSerialization.jsonObject(with:bytes)) as? [String:Int],let r1=obj["r1"],let c1=obj["c1"],let r2=obj["r2"],let c2=obj["c2"] else { return nil }; return CellRange(r1:r1,c1:c1,r2:r2,c2:c2) }
             if let source = range("source"), let target = range("target") { do { try commitEdits(book.autofillEdits(picker.indexOfSelectedItem,source:source,target:target)) } catch { editError(error) } }
-            else { web.evaluateJavaScript("editResult(true,'')",completionHandler:nil) }
+            else { web.gridJS("editResult(true,'')",completionHandler:nil) }
         case "copyText": NSPasteboard.general.clearContents(); NSPasteboard.general.setString(data["value"] ?? "",forType:.string)
-        case "pasteInput": if let text = NSPasteboard.general.string(forType:.string) { web.evaluateJavaScript("pasteInput(\(jsonString(text)))",completionHandler:nil) }
+        case "pasteInput": if let text = NSPasteboard.general.string(forType:.string) { web.gridJS("pasteInput(\(jsonString(text)))",completionHandler:nil) }
         default: break
         }
     }
@@ -2913,12 +2947,20 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScript
         }
     }
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { webView.pageZoom = zoom;
-        if let range = pendingGridSelection { pendingGridSelection = nil; web.evaluateJavaScript("select(ensure(\(range.r1),\(range.c1)));select(ensure(\(range.r2),\(range.c2)),true,true)",completionHandler:nil) }
- if paintStyle != nil { web.evaluateJavaScript("armPaint(true)",completionHandler:nil) } }
+        if let range = pendingGridSelection { pendingGridSelection = nil; web.gridJS("select(ensure(\(range.r1),\(range.c1)));select(ensure(\(range.r2),\(range.c2)),true,true)",completionHandler:nil) }
+ if paintStyle != nil { web.gridJS("armPaint(true)",completionHandler:nil) } }
     func show(_ error: Error) { NSAlert(error: error).runModal() }
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         if let url = action.request.url, url.isFileURL, supportedExtensions.contains(url.pathExtension.lowercased()) { decisionHandler(.cancel); load(url); return }
         decisionHandler(action.navigationType == .other ? .allow : .cancel)
+    }
+}
+
+
+// Every command sent to the sheet page first completes any rows still being appended progressively.
+extension WKWebView {
+    func gridJS(_ script: String, completionHandler: ((Any?, Error?) -> Void)? = nil) {
+        evaluateJavaScript("window.flushRest&&flushRest();" + script, completionHandler: completionHandler)
     }
 }
 

@@ -16,7 +16,7 @@ func scheduleLegacySheetTests(_ app: App, fixture: URL) {
         print("PASS: \(message)")
     }
     func js(_ script: String, _ done: @escaping (Any?) -> Void) {
-        app.web.evaluateJavaScript(script) { value, error in
+        app.web.gridJS(script) { value, error in
             if let error { fputs("JS ERROR: \(error)\n", stderr); exit(1) }
             done(value)
         }
@@ -35,6 +35,10 @@ func scheduleLegacySheetTests(_ app: App, fixture: URL) {
         waitUntil({ app.book != nil && !app.loading && !app.web.isLoading }) {
             print(String(format: "INFO: opened in %.2f s", Date().timeIntervalSince(started)))
             check(app.picker.numberOfItems == 2, "Sheet picker lists all sheets")
+            // Raw call (no flush): the page must paint with only the head rows, the rest arrives progressively.
+            app.web.evaluateJavaScript("document.querySelectorAll('tbody tr').length") { first, _ in
+                check(((first as? Int) ?? 0) >= 150 && ((first as? Int) ?? 0) < 20001, "Large sheet paints its first rows before the rest")
+            }
             js("document.querySelectorAll('tbody tr').length") { rows in
                 check((rows as? Int) == 20001, "All rows rendered")
                 js("document.querySelector('tr[data-row=\"2\"] td[data-c=\"1\"]').click()") { _ in
@@ -569,7 +573,7 @@ func scheduleSheetTests(_ app: App, fixture: URL) {
         func pause(_ seconds: Double = 0.08) async { try? await Task.sleep(nanoseconds:UInt64(seconds*1e9)) }
         @MainActor func js(_ script: String) async -> Any? {
             await withCheckedContinuation { continuation in
-                app.web.evaluateJavaScript(script) { value,error in
+                app.web.gridJS(script) { value,error in
                     if let error { fputs("JS ERROR: \(error)\n",stderr); exit(1) }
                     continuation.resume(returning:value)
                 }

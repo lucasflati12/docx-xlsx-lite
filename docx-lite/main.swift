@@ -810,6 +810,106 @@ private func canonicalHeading(_ value: String) -> String? {
     let key = value.lowercased().replacingOccurrences(of: " ", with: "")
     return wordStyleIDs.first { $0.lowercased() == key }
 }
+// AppKit's DOCX importer ignores styles.xml (Title, Heading, List Bullet… come in as plain text) and treats
+// switched-off toggles such as <w:b w:val="0"/> as switched ON. On the temporary import copy only, resolve
+// docDefaults + paragraph/character styles (basedOn chain) into direct properties and drop "off" toggles.
+// The user's file and the saved package are untouched by this pass.
+private let runPropertyOrder = ["rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps", "strike", "dstrike", "outline", "shadow", "emboss", "imprint", "noProof", "snapToGrid", "vanish", "webHidden", "color", "spacing", "w", "kern", "position", "sz", "szCs", "highlight", "u", "effect", "bdr", "shd", "fitText", "vertAlign", "rtl", "cs", "em", "lang", "eastAsianLayout", "specVanish", "oMath"]
+private let paragraphPropertyOrder = ["pStyle", "keepNext", "keepLines", "pageBreakBefore", "framePr", "widowControl", "numPr", "suppressLineNumbers", "pBdr", "shd", "tabs", "suppressAutoHyphens", "kinsoku", "wordWrap", "overflowPunct", "topLinePunct", "autoSpaceDE", "autoSpaceDN", "bidi", "adjustRightInd", "snapToGrid", "spacing", "ind", "contextualSpacing", "mirrorIndents", "suppressOverlap", "jc", "textDirection", "textAlignment", "textboxTightWrap", "outlineLvl", "divId", "cnfStyle", "rPr", "sectPr", "pPrChange"]
+private let toggleRunProperties: Set<String> = ["b", "bCs", "i", "iCs", "caps", "smallCaps", "strike", "dstrike", "outline", "shadow", "emboss", "imprint", "vanish", "webHidden", "noProof", "snapToGrid", "specVanish"]
+// Paragraph-level properties a style may contribute; tabs/borders/shading stay with AppKit's defaults.
+private let inheritedParagraphProperties: Set<String> = ["keepNext", "keepLines", "pageBreakBefore", "numPr", "spacing", "ind", "contextualSpacing", "jc"]
+
+private func isSwitchedOff(_ element: XMLElement) -> Bool {
+    guard toggleRunProperties.contains(element.localName ?? "") else { return false }
+    return ["0", "false", "off"].contains((xmlValue(element, "val") ?? "1").lowercased())
+}
+
+private func sortProperties(_ container: XMLElement, order: [String]) {
+    let children = (container.children ?? [])
+    let ranked = children.enumerated().sorted { a, b in
+        let ra = order.firstIndex(of: a.element.localName ?? "") ?? order.count, rb = order.firstIndex(of: b.element.localName ?? "") ?? order.count
+        return ra != rb ? ra < rb : a.offset < b.offset
+    }.map { $0.element }
+    guard ranked.map({ ObjectIdentifier($0) }) != children.map({ ObjectIdentifier($0) }) else { return }
+    for child in children { child.detach() }
+    for child in ranked { container.addChild(child) }
+}
+
+@discardableResult
+private func applyStyleFormatting(_ xml: XMLDocument, url: URL, package: DOCXPackage?) throws -> Bool {
+    var changed = false
+    var styles: [String: XMLElement] = [:], defaultParagraph: String?
+    var defaultRun: [String: XMLElement] = [:], defaultParagraphProps: [String: XMLElement] = [:]
+    if let data = try? archiveMember(url, package?.relatedPart("styles") ?? "word/styles.xml"),
+       let doc = try? XMLDocument(data: data, options: [.nodeLoadExternalEntitiesNever]) {
+        for case let style as XMLElement in try doc.nodes(forXPath: "//*[local-name()='style']") {
+            guard let id = xmlValue(style, "styleId") else { continue }
+            styles[id] = style
+            if xmlValue(style, "type") == "paragraph", ["1", "true", "on"].contains(xmlValue(style, "default") ?? "") { defaultParagraph = id }
+        }
+        for case let property as XMLElement in try doc.nodes(forXPath: "//*[local-name()='docDefaults']/*[local-name()='rPrDefault']/*[local-name()='rPr']/*") {
+            if let name = property.localName { defaultRun[name] = property }
+        }
+        for case let property as XMLElement in try doc.nodes(forXPath: "//*[local-name()='docDefaults']/*[local-name()='pPrDefault']/*[local-name()='pPr']/*") {
+            if let name = property.localName, inheritedParagraphProperties.contains(name) { defaultParagraphProps[name] = property }
+        }
+    }
+    // Resolved (run, paragraph) properties per style id, following basedOn (cycle-safe).
+    var cache: [String: ([String: XMLElement], [String: XMLElement])] = [:]
+    func resolve(_ id: String, _ seen: Set<String> = []) -> ([String: XMLElement], [String: XMLElement]) {
+        if let hit = cache[id] { return hit }
+        guard let style = styles[id], !seen.contains(id) else { return ([:], [:]) }
+        var run: [String: XMLElement] = [:], paragraph: [String: XMLElement] = [:]
+        if let base = (style.children?.first(where: { $0.localName == "basedOn" }) as? XMLElement).flatMap({ xmlValue($0, "val") }) {
+            (run, paragraph) = resolve(base, seen.union([id]))
+        }
+        for case let rPr as XMLElement in style.children ?? [] where rPr.localName == "rPr" {
+            for case let property as XMLElement in rPr.children ?? [] { if let name = property.localName { run[name] = property } }
+        }
+        for case let pPr as XMLElement in style.children ?? [] where pPr.localName == "pPr" {
+            for case let property as XMLElement in pPr.children ?? [] {
+                if let name = property.localName, inheritedParagraphProperties.contains(name) { paragraph[name] = property }
+            }
+        }
+        cache[id] = (run, paragraph)
+        return (run, paragraph)
+    }
+    for case let paragraph as XMLElement in try xml.nodes(forXPath: "//*[local-name()='body']//*[local-name()='p']") where paragraph.uri == wordNamespace {
+        let pPr = paragraph.children?.first(where: { $0.localName == "pPr" }) as? XMLElement
+        let styleID = (pPr?.children?.first(where: { $0.localName == "pStyle" }) as? XMLElement).flatMap { xmlValue($0, "val") } ?? defaultParagraph
+        var (styleRun, styleParagraph) = styleID.map { resolve($0) } ?? ([:], [:])
+        styleRun = defaultRun.merging(styleRun) { $1 }
+        styleParagraph = defaultParagraphProps.merging(styleParagraph) { $1 }
+        // Paragraph properties: only fill what the paragraph does not set itself.
+        let missing = styleParagraph.filter { name, _ in pPr?.children?.contains(where: { $0.localName == name }) != true }
+        if !missing.isEmpty {
+            let target = pPr ?? { let created = wordElement("pPr"); paragraph.insertChild(created, at: 0); return created }()
+            for (_, property) in missing { target.addChild(property.copy() as! XMLElement) }
+            sortProperties(target, order: paragraphPropertyOrder); changed = true
+        }
+        for case let run as XMLElement in try paragraph.nodes(forXPath: ".//*[local-name()='r']") where run.uri == wordNamespace {
+            // Runs of nested paragraphs (text boxes) are handled with their own paragraph.
+            guard ancestor(run.parent ?? run, named: "p") === paragraph else { continue }
+            let rPr = run.children?.first(where: { $0.localName == "rPr" }) as? XMLElement
+            var inherited = styleRun
+            if let character = (rPr?.children?.first(where: { $0.localName == "rStyle" }) as? XMLElement).flatMap({ xmlValue($0, "val") }) {
+                inherited.merge(resolve(character).0) { $1 }
+            }
+            inherited.removeValue(forKey: "rStyle")
+            let own = Set((rPr?.children ?? []).compactMap { $0.localName })
+            let additions = inherited.filter { !own.contains($0.key) }
+            let offToggles = (rPr?.children ?? []).compactMap { $0 as? XMLElement }.filter(isSwitchedOff)
+            guard !additions.isEmpty || !offToggles.isEmpty else { continue }
+            let target = rPr ?? { let created = wordElement("rPr"); run.insertChild(created, at: 0); return created }()
+            for (_, property) in additions { target.addChild(property.copy() as! XMLElement) }
+            for case let element as XMLElement in target.children ?? [] where isSwitchedOff(element) { element.detach() }
+            sortProperties(target, order: runPropertyOrder); changed = true
+        }
+    }
+    return changed
+}
+
 private func prepareParagraphs(_ url: URL, xml: XMLDocument, prefix: String, package: DOCXPackage?) throws -> [EmbeddedParagraph] {
     var styleIDs: [String: String] = [:]
     if let data = try? archiveMember(url, package?.relatedPart("styles") ?? "word/styles.xml"), let styles = try? XMLDocument(data: data, options: [.nodeLoadExternalEntitiesNever]) {
@@ -930,6 +1030,7 @@ func archiveMember(_ archive: URL, _ member: String) throws -> Data {
 private func preparePictures(_ url: URL, in temporary: URL, package: DOCXPackage?) throws -> (URL, [EmbeddedPicture], [EmbeddedLink], [EmbeddedStyle], [EmbeddedParagraph], [ImportedAnchor]) {
     let xml = try XMLDocument(data: archiveMember(url, "word/document.xml"), options: [.nodePreserveWhitespace, .nodeLoadExternalEntitiesNever])
     let retained = try prepareRetainedAnchors(xml, package: package)
+    let styled = try applyStyleFormatting(xml, url: url, package: package)
     let drawings = try xml.nodes(forXPath: "//*[local-name()='drawing' or local-name()='pict']")
     let hyperlinks = try xml.nodes(forXPath: "//*[local-name()='hyperlink']")
     let runs = try xml.nodes(forXPath: "//*[local-name()='r']")
@@ -1001,7 +1102,7 @@ private func preparePictures(_ url: URL, in temporary: URL, package: DOCXPackage
         styles.append(EmbeddedStyle(start: start, end: end, color: color, lineMultiple: multiple))
     }
     let paragraphs = try prepareParagraphs(url, xml: xml, prefix: prefix, package: package)
-    guard !pictures.isEmpty || !links.isEmpty || !styles.isEmpty || !paragraphs.isEmpty || !retained.isEmpty || package?.finalSection != nil else { return (url, [], [], [], [], []) }
+    guard styled || !pictures.isEmpty || !links.isEmpty || !styles.isEmpty || !paragraphs.isEmpty || !retained.isEmpty || package?.finalSection != nil else { return (url, [], [], [], [], []) }
     try FileManager.default.createDirectory(at: temporary.appendingPathComponent("word"), withIntermediateDirectories: true)
     let copy = temporary.appendingPathComponent("document.docx")
     try FileManager.default.copyItem(at: url, to: copy)

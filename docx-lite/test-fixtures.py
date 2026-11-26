@@ -163,3 +163,37 @@ for filename, unsupported in [('retained.docx', False), ('unsupported.docx', Tru
                 data = data.replace(section_two, extra + section_two)
             archive.writestr(path, data)
 print('retained.docx, unsupported.docx')
+
+# styles.docx: formatting that lives only in styles.xml (Title, Heading 1, a list style, a bold paragraph
+# style, a character style) plus switched-off toggles (<w:b w:val="0"/>), which AppKit's importer mishandles.
+W_NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+def styled_p(text, style=None, run_props=''):
+    ppr = f'<w:pPr><w:pStyle w:val="{style}"/></w:pPr>' if style else ''
+    rpr = f'<w:rPr>{run_props}</w:rPr>' if run_props else ''
+    return f'<w:p>{ppr}<w:r>{rpr}<w:t xml:space="preserve">{text}</w:t></w:r></w:p>'
+styled_body = ''.join([
+    styled_p('Styled title', 'Title'), styled_p('Styled heading', 'Heading1'), styled_p('Styled bullet', 'ListBullet'),
+    styled_p('Not bold explicitly', None, '<w:b w:val="0"/>'), styled_p('Not italic explicitly', None, '<w:i w:val="false"/>'),
+    '<w:p><w:pPr><w:pStyle w:val="BoldPara"/></w:pPr><w:r><w:rPr><w:b w:val="0"/></w:rPr><w:t xml:space="preserve">Override not bold </w:t></w:r><w:r><w:t>Inherited bold</w:t></w:r></w:p>',
+    styled_p('Character style italic', None, '<w:rStyle w:val="Emphasis"/>'),
+])
+styled_styles = (f'<w:styles {W_NS}><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Helvetica" w:hAnsi="Helvetica"/><w:sz w:val="24"/></w:rPr></w:rPrDefault></w:docDefaults>'
+    '<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>'
+    '<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:basedOn w:val="Normal"/><w:rPr><w:b/><w:color w:val="1F4EA0"/><w:sz w:val="56"/></w:rPr></w:style>'
+    '<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:pPr><w:keepNext/></w:pPr><w:rPr><w:b/><w:sz w:val="32"/></w:rPr></w:style>'
+    '<w:style w:type="paragraph" w:styleId="ListBullet"><w:name w:val="List Bullet"/><w:basedOn w:val="Normal"/><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr></w:style>'
+    '<w:style w:type="paragraph" w:styleId="BoldPara"><w:name w:val="Bold Para"/><w:basedOn w:val="Normal"/><w:rPr><w:b/></w:rPr></w:style>'
+    '<w:style w:type="character" w:styleId="Emphasis"><w:name w:val="Emphasis"/><w:rPr><w:i/></w:rPr></w:style></w:styles>')
+styled_numbering = (f'<w:numbering {W_NS}><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="•"/></w:lvl></w:abstractNum>'
+    '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>')
+with zipfile.ZipFile(out / 'styles.docx', 'w', zipfile.ZIP_DEFLATED) as z:
+    z.writestr('[Content_Types].xml', '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>'
+               '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+               '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
+               '<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/></Types>')
+    z.writestr('_rels/.rels', root_rels)
+    z.writestr('word/_rels/document.xml.rels', '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/></Relationships>')
+    z.writestr('word/document.xml', f'<w:document {W_NS}><w:body>{styled_body}<w:sectPr/></w:body></w:document>')
+    z.writestr('word/styles.xml', styled_styles)
+    z.writestr('word/numbering.xml', styled_numbering)
+print('styles.docx')
